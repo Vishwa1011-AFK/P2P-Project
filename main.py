@@ -57,7 +57,7 @@ async def chat_input():
               if not sent:
                   print(f"Failed to send message to {peer_ip}")
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     # Start broadcast threads
     broadcast_thread = threading.Thread(target=send_broadcasts, daemon=True)
     broadcast_thread.start()
