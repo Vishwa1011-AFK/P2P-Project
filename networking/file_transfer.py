@@ -64,6 +64,12 @@ def get_files_in_folder(folder_path):
             file_list.append((full_path, rel_path))
     return file_list
 
+async def send_folder(folder_path, peers):
+    """Send all files in a folder to specified peers, preserving structure."""
+    file_list = get_files_in_folder(folder_path)
+    for full_path, rel_path in file_list:
+        await send_file(full_path, peers.copy(), relative_path=rel_path)
+
 async def send_file(file_path, peers, relative_path=None):
     """Send a file to specified peers concurrently."""
     transfer_id = str(uuid.uuid4())
