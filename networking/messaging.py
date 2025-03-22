@@ -15,9 +15,12 @@ from networking.utils import get_own_ip
 from networking.shared_state import (
     active_transfers, message_queue, connections, user_data, peer_public_keys, peer_usernames, shutdown_event
 )
-from networking.file_transfer import send_file, FileTransfer, TransferState
+from networking.file_transfer import send_file, send_folder, FileTransfer, TransferState
 from websockets.connection import State
 from appdirs import user_config_dir
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.completion import WordCompleter
 
 # Global state
 peer_list = {}  # {ip: (username, last_seen)}
@@ -346,21 +349,49 @@ async def receive_peer_messages(websocket, peer_ip):
 
                 if message_type == "file_transfer_init":
                     transfer_id = data["transfer_id"]
-                    file_name = data["filename"]
+                    relative_path = data["relative_path"]
                     file_size = data["filesize"]
                     expected_hash = data.get("file_hash")
-                    file_path = os.path.join("downloads", file_name)
-                    os.makedirs("downloads", exist_ok=True)
-                    transfer = FileTransfer(file_path, peer_ip, direction="receive")
-                    transfer.transfer_id = transfer_id
-                    transfer.total_size = file_size
-                    transfer.expected_hash = expected_hash
-                    transfer.hash_algo = hashlib.sha256() if expected_hash else None
-                    transfer.state = TransferState.IN_PROGRESS
-                    transfer.file_handle = await aiofiles.open(file_path, "wb")
-                    active_transfers[transfer_id] = transfer
                     peer_username = next(u for u, ip in peer_usernames.items() if ip == peer_ip)
-                    await message_queue.put(f"{user_data['original_username']} receiving '{file_name}' from {peer_username} (Transfer ID: {transfer_id})")
+                    await message_queue.put({
+                        "type": "file_approval_request",
+                        "transfer_id": transfer_id,
+                        "peer_username": peer_username,
+                        "relative_path": relative_path,
+                        "file_size": file_size
+                    })
+                    approval_future = asyncio.Future()
+                    pending_file_approvals[transfer_id] = approval_future
+                    try:
+                        approved = await asyncio.wait_for(approval_future, timeout=30.0)
+                    except asyncio.TimeoutError:
+                        approved = False
+                    del pending_file_approvals[transfer_id]
+                    await websocket.send(json.dumps({
+                        "type": "file_transfer_ack",
+                        "transfer_id": transfer_id,
+                        "approved": approved
+                    }))
+                    if approved:
+                        file_path = os.path.join("downloads", relative_path)
+                        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                        transfer = FileTransfer(file_path, peer_ip, direction="receive")
+                        transfer.transfer_id = transfer_id
+                        transfer.total_size = file_size
+                        transfer.expected_hash = expected_hash
+                        transfer.hash_algo = hashlib.sha256() if expected_hash else None
+                        transfer.state = TransferState.IN_PROGRESS
+                        transfer.file_handle = await aiofiles.open(file_path, "wb")
+                        active_transfers[transfer_id] = transfer
+                        await message_queue.put(f"{user_data['original_username']} receiving '{relative_path}' from {peer_username} (Transfer ID: {transfer_id})")
+                    else:
+                        await message_queue.put(f"{user_data['original_username']} denied file transfer for '{relative_path}' from {peer_username}")
+
+                elif message_type == "file_transfer_ack":
+                    transfer_id = data["transfer_id"]
+                    approved = data["approved"]
+                    if transfer_id in pending_file_approvals and not pending_file_approvals[transfer_id].done():
+                        pending_file_approvals[transfer_id].set_result(approved)
 
                 elif message_type == "file_chunk":
                     transfer_id = data["transfer_id"]
@@ -423,10 +454,17 @@ async def receive_peer_messages(websocket, peer_ip):
 async def user_input(discovery):
     """Handle user input with centralized control."""
     await asyncio.sleep(1)
+    # Initialize PromptSession with history and basic command completion
+    history = InMemoryHistory()
+    commands = ["/connect", "/disconnect", "/msg", "/send", "/pause", "/resume", "/transfers", "/list", "/changename", "/exit", "/help"]
+    completer = WordCompleter(commands, ignore_case=True)
+    session = PromptSession(history=history, completer=completer)
+    
     while not shutdown_event.is_set():
         try:
-            message = await ainput(f"{user_data['original_username']} > ")
-
+            message = await session.prompt_async(f"{user_data['original_username']} > ")
+            
+            # Rest of the command handling remains the same
             if message == "/exit":
                 print("Shutting down application...")
                 shutdown_event.set()
@@ -500,12 +538,18 @@ async def user_input(discovery):
                 if len(parts) < 2:
                     print("Usage: /send <username> <file_path>")
                     continue
-                target_username, file_path = parts
+                target_username, item_path = parts
                 if target_username in peer_usernames:
                     peer_ip = peer_usernames[target_username]
                     if peer_ip in connections:
-                        asyncio.create_task(send_file(file_path, {peer_ip: connections[peer_ip]}))
-                        print(f"Started sending {file_path} to {target_username}")
+                        if os.path.isdir(item_path):
+                            asyncio.create_task(send_folder(item_path, {peer_ip: connections[peer_ip]}))
+                            print(f"Started sending folder {item_path} to {target_username}")
+                        elif os.path.isfile(item_path):
+                            asyncio.create_task(send_file(item_path, {peer_ip: connections[peer_ip]}))
+                            print(f"Started sending file {item_path} to {target_username}")
+                        else:
+                            print(f"Path does not exist or is not a file/folder: {item_path}")
                     else:
                         print(f"Not connected to {target_username}")
                 else:
@@ -562,6 +606,12 @@ async def user_input(discovery):
                 if not future.done():
                     future.set_result(message.lower() == "yes")
                 continue
+            
+            elif message.lower() in ("yes", "no") and pending_file_approvals:
+                transfer_id, future = next(iter(pending_file_approvals.items()))
+                if not future.done():
+                    future.set_result(message.lower() == "yes")
+                continue
 
             elif not message.startswith("/"):
                 if connections:
@@ -581,10 +631,12 @@ async def display_messages():
     while not shutdown_event.is_set():
         try:
             item = await message_queue.get()
-            if isinstance(item, dict) and item.get("type") == "approval_request":
-                peer_ip = item["peer_ip"]
-                requesting_username = item["requesting_username"]
-                print(f"\nConnection request from {requesting_username} ({peer_ip}). Approve? (yes/no)")
+            if isinstance(item, dict) and item.get("type") == "file_approval_request":
+                transfer_id = item["transfer_id"]
+                peer_username = item["peer_username"]
+                relative_path = item["relative_path"]
+                file_size = item["file_size"]
+                print(f"\nFile transfer request from {peer_username}: {relative_path} ({file_size} bytes). Accept? (yes/no)")
             else:
                 print(f"\n{item}")
             # Prompt is handled by user_input(), no extra print here

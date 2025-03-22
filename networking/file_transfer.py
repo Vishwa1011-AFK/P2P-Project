@@ -54,40 +54,70 @@ async def compute_hash(file_path):
             hash_algo.update(chunk)  # Update hash with each chunk
     return hash_algo.hexdigest()
 
-async def send_file(file_path, peers):
+def get_files_in_folder(folder_path):
+    """Recursively collect all files in a folder with their relative paths."""
+    file_list = []
+    for root, dirs, files in os.walk(folder_path):
+        for file in files:
+            full_path = os.path.join(root, file)
+            rel_path = os.path.relpath(full_path, folder_path)
+            file_list.append((full_path, rel_path))
+    return file_list
+
+async def send_file(file_path, peers, relative_path=None):
     """Send a file to specified peers concurrently."""
     transfer_id = str(uuid.uuid4())
     file_size = os.path.getsize(file_path)
-    file_name = os.path.basename(file_path)
-
-    # Compute hash in chunks
+    if relative_path is None:
+        relative_path = os.path.basename(file_path)
+    
     file_hash = await compute_hash(file_path)
-
-    # Initialize transfer object
+    
     transfer = FileTransfer(file_path, list(peers.keys())[0], direction="send")
     transfer.transfer_id = transfer_id
     transfer.total_size = file_size
     transfer.expected_hash = file_hash
     active_transfers[transfer_id] = transfer
-
-    # Send initialization message
+    
     init_message = json.dumps({
         "type": "file_transfer_init",
         "transfer_id": transfer_id,
-        "filename": file_name,
+        "relative_path": relative_path,
         "filesize": file_size,
         "file_hash": file_hash
     })
-
+    
+    # Store futures for approval from each peer
+    from networking.shared_state import pending_file_approvals
+    pending_file_approvals[transfer_id] = {peer_ip: asyncio.Future() for peer_ip in peers}
     for peer_ip, websocket in peers.items():
         try:
             await websocket.send(init_message)
         except Exception as e:
             logging.error(f"Failed to send file init to {peer_ip}: {e}")
             del active_transfers[transfer_id]
+            del pending_file_approvals[transfer_id]
             return
-
-    # Send file chunks
+    
+    # Wait for approvals with a timeout
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*pending_file_approvals[transfer_id].values()),
+            timeout=30.0
+        )
+    except asyncio.TimeoutError:
+        logging.info(f"File transfer {transfer_id} approval timed out for some peers")
+    
+    approved_peers = {peer_ip: peers[peer_ip] for peer_ip, future in pending_file_approvals[transfer_id].items() if future.done() and future.result()}
+    del pending_file_approvals[transfer_id]
+    
+    if not approved_peers:
+        logging.info(f"File transfer {transfer_id} denied by all peers")
+        del active_transfers[transfer_id]
+        return
+    
+    peers = approved_peers
+    
     async with aiofiles.open(file_path, "rb") as f:
         transfer.file_handle = f
         chunk_size = 1024 * 1024  # 1MB chunks
