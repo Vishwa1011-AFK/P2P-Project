@@ -5,7 +5,6 @@ import websockets
 from networking.discovery import PeerDiscovery
 from networking.messaging import (
     user_input,
-    display_messages,
     receive_peer_messages,
     handle_incoming_connection,
     connections,
@@ -40,16 +39,13 @@ async def main():
     await initialize_user_config()
 
     discovery = PeerDiscovery()
-    # Define all tasks
     broadcast_task = asyncio.create_task(discovery.send_broadcasts())
     discovery_task = asyncio.create_task(discovery.receive_broadcasts())
     cleanup_task = asyncio.create_task(discovery.cleanup_stale_peers())
     progress_task = asyncio.create_task(update_transfer_progress())
     maintain_task = asyncio.create_task(maintain_peer_list(discovery))
     input_task = asyncio.create_task(user_input(discovery))
-    display_task = asyncio.create_task(display_messages())
 
-    # Start WebSocket server
     server = await websockets.serve(
         handle_peer_connection,
         "0.0.0.0",
@@ -66,7 +62,6 @@ async def main():
         progress_task,
         maintain_task,
         input_task,
-        display_task,
     ]
 
     try:
@@ -79,22 +74,18 @@ async def main():
     finally:
         logging.info("Initiating shutdown process...")
 
-        # Cancel all tasks
         for task in tasks:
             if not task.done():
                 task.cancel()
                 logging.info(f"Canceled task: {task.get_name()}")
 
-        # Wait for tasks to finish with a timeout
         await asyncio.wait(tasks, timeout=2.0)
 
-        # Close WebSocket server
         logging.info("Closing WebSocket server...")
         server.close()
         await server.wait_closed()
         logging.info("WebSocket server closed.")
 
-        # Close all peer connections
         for peer_ip, websocket in list(connections.items()):
             try:
                 if websocket.open:
@@ -106,11 +97,9 @@ async def main():
         peer_public_keys.clear()
         peer_usernames.clear()
 
-        # Stop discovery
         logging.info("Stopping discovery...")
         discovery.stop()
 
-        # Clean up file transfers
         from networking.file_transfer import active_transfers
         for transfer_id, transfer in list(active_transfers.items()):
             if transfer.file_handle:

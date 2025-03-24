@@ -51,7 +51,7 @@ async def compute_hash(file_path):
             chunk = await f.read(1024 * 1024)  # Read 1MB chunks
             if not chunk:
                 break
-            hash_algo.update(chunk)  # Update hash with each chunk
+            hash_algo.update(chunk)
     return hash_algo.hexdigest()
 
 def get_files_in_folder(folder_path):
@@ -84,6 +84,7 @@ async def send_file(file_path, peers, relative_path=None):
     transfer.total_size = file_size
     transfer.expected_hash = file_hash
     active_transfers[transfer_id] = transfer
+    logging.info(f"Added transfer {transfer_id} to active_transfers for sending {file_path}")
     
     init_message = json.dumps({
         "type": "file_transfer_init",
@@ -93,7 +94,6 @@ async def send_file(file_path, peers, relative_path=None):
         "file_hash": file_hash
     })
     
-    # Store futures for approval from each peer
     from networking.shared_state import pending_file_approvals
     pending_file_approvals[transfer_id] = {peer_ip: asyncio.Future() for peer_ip in peers}
     for peer_ip, websocket in peers.items():
@@ -105,7 +105,6 @@ async def send_file(file_path, peers, relative_path=None):
             del pending_file_approvals[transfer_id]
             return
     
-    # Wait for approvals with a timeout
     try:
         await asyncio.wait_for(
             asyncio.gather(*pending_file_approvals[transfer_id].values()),
@@ -166,6 +165,7 @@ async def update_transfer_progress():
                     if transfer.file_handle:
                         await transfer.file_handle.close()
                     del active_transfers[transfer_id]
+                    logging.info(f"Removed transfer {transfer_id} from active_transfers (State: {transfer.state.value})")
                 elif transfer.total_size > 0:
                     progress = (transfer.transferred_size / transfer.total_size) * 100
                     logging.debug(f"Transfer {transfer_id}: {progress:.2f}%")
