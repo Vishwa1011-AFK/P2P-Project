@@ -2,10 +2,11 @@ import asyncio
 from collections import defaultdict
 
 shutdown_event = asyncio.Event()
-active_transfers = {}
+active_transfers = {} 
 message_queue = asyncio.Queue()
-connections = {}  # {peer_ip: websocket}
+connections = {}
 user_data = {}
-peer_public_keys = {}  # {peer_ip: public_key}
-peer_usernames = {}  # {username: peer_ip}
-pending_file_approvals = {}  # {transfer_id: asyncio.Future}
+peer_public_keys = {}
+peer_usernames = {}  
+pending_file_receive_approvals = {}
+pending_file_send_acks = {}
