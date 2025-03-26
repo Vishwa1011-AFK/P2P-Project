@@ -19,7 +19,8 @@ from networking.shared_state import (
 from networking.file_transfer import send_file, send_folder, FileTransfer, TransferState
 from websockets.connection import State as WebSocketState # Rename to avoid confusion
 from appdirs import user_config_dir
-from websockets.protocol import WebSocketCommonProtocol
+from websockets.server import WebSocketServerProtocol
+from websockets.client import WebSocketClientProtocol
 from websockets.connection import State as WebSocketState
 # --- TUI Setup ---
 from prompt_toolkit import Application, print_formatted_text
@@ -539,7 +540,7 @@ async def send_message_to_peers(message_content, target_username=None):
             await message_queue.put(f"Error: No peer named '{target_username}' connected.")
             return False
         websocket = connections.get(peer_ip) # Use .get() for safety
-        if not isinstance(websocket, WebSocketCommonProtocol) or not websocket.open:
+        if not isinstance(websocket, (WebSocketServerProtocol, WebSocketClientProtocol)) or not websocket.open:
             await message_queue.put(f"Error: Connection to '{target_username}' is invalid or closed.")
             # Cleanup inconsistent state if necessary
             if peer_ip in connections: del connections[peer_ip]
@@ -552,7 +553,7 @@ async def send_message_to_peers(message_content, target_username=None):
         valid_peers_to_send = {}
         for ip, ws in connections.items():
             # Check if it's a valid websocket object AND is open
-            if isinstance(ws, WebSocketCommonProtocol) and ws.open:
+            if isinstance(ws, (WebSocketServerProtocol, WebSocketClientProtocol)) and ws.open:
                 valid_peers_to_send[ip] = ws
             else:
                 # Log if we find an invalid entry - helps debugging
@@ -990,7 +991,7 @@ yes / no                - Respond to connection or file transfer requests.
                   await message_queue.put(f"Error: Peer '{target_username}' is not connected.")
                   return
              websocket = connections.get(peer_ip)
-             if not isinstance(websocket, WebSocketCommonProtocol) or not websocket.open:
+             if not isinstance(websocket, (WebSocketServerProtocol, WebSocketClientProtocol)) or not websocket.open:
                 await message_queue.put(f"Error: Connection to '{target_username}' is invalid or closed.")
                 # Optional cleanup like in send_message_to_peers if needed here too
                 return
@@ -1208,7 +1209,7 @@ async def user_input(discovery, initial_messages=None): # Added initial_messages
 
                 # --- Safely update TUI output area ---
                 def update_output(text_to_add, set_conn_ip, set_file_id):
-                    """Nested function to perform the actual UI update more efficiently."""
+                    """Nested function to perform the actual UI update by assigning to TextArea.text."""
                     global current_connection_approval_ip, current_file_approval_id
                     try:
                         # --- Update global approval state (same as before) ---
@@ -1222,49 +1223,46 @@ async def user_input(discovery, initial_messages=None): # Added initial_messages
                             logging.debug(f"Set pending file approval for ID: {set_file_id}")
                         # --- End Approval State Update ---
 
-                        # --- Efficiently Append Text and Scroll ---
-                        # Get the buffer associated with the output area
-                        buffer = output_area.buffer
+                        # --- Get current text directly from the widget ---
+                        # Use output_area.text which is the public attribute
+                        current_text = output_area.text
 
-                        # Check if we need a newline before appending
-                        # Add newline if buffer isn't empty AND doesn't already end with newline
+                        # --- Determine prefix (same as before) ---
                         prefix = ""
-                        if buffer.text and not buffer.text.endswith('\n'):
+                        if current_text and not current_text.endswith('\n'):
                             prefix = "\n"
 
-                        # Prepare the full text to insert (prefix + new message)
-                        text_to_insert = prefix + text_to_add
+                        # --- Construct the potential new full text ---
+                        new_full_text = current_text + prefix + text_to_add
 
-                        # Move cursor to the end of the buffer *before* inserting
-                        buffer.cursor_position = len(buffer.text)
-
-                        # Insert the new text at the current cursor position (which is the end)
-                        buffer.insert_text(text_to_insert)
-
-                        # --- Limit Buffer Lines (Optional but recommended) ---
+                        # --- Limit Buffer Lines ---
                         max_lines = 1000 # Adjust as needed
-                        if buffer.line_count > max_lines:
-                            # Calculate how many lines to delete from the beginning
-                            lines_to_delete = buffer.line_count - max_lines
-                            # Get the character position at the end of the lines to delete
-                            delete_until_pos = buffer.document.translate_row_col_to_index(lines_to_delete, 0)
-                            # Create a change object to delete text from start to that position
-                            # Note: This API might need adjustment based on prompt_toolkit version specifics
-                            # A simpler, though potentially less performant way if the above is complex:
-                            current_lines = buffer.text.split('\n')
-                            new_text = '\n'.join(current_lines[-max_lines:])
-                            # Reset the entire buffer text if limiting is needed
-                            buffer.reset(initial_document=Document(text=new_text, cursor_position=len(new_text)))
+                        lines = new_full_text.split('\n')
+                        if len(lines) > max_lines:
+                            # Keep only the last max_lines lines
+                            final_text = '\n'.join(lines[-max_lines:])
                         else:
-                            # Ensure cursor is at the very end after insertion if no lines were deleted
-                            buffer.cursor_position = len(buffer.text)
+                            final_text = new_full_text
                         # --- End Buffer Limiting ---
 
-                        # No need to manually set output_area.text, buffer manipulation handles it.
-                        # The invalidate call later will trigger the redraw with the updated buffer.
+                        # --- Assign the final text directly to the widget's text attribute ---
+                        # This is the simplest way, relying on the widget to handle its internal buffer.
+                        output_area.text = final_text
+
+                        # We don't manipulate the buffer or Document directly.
+                        # Setting the text attribute should implicitly update the underlying buffer.
+
+                        # Attempting to set cursor position *after* .text assignment might still be fragile.
+                        # Let's rely on prompt_toolkit's default behavior or omit explicit cursor setting for stability.
+                        # If scrolling becomes an issue, we can revisit, but let's stop the crashes first.
+                        # try:
+                        #     buffer = output_area.buffer
+                        #     buffer.cursor_position = len(buffer.text)
+                        # except Exception:
+                        #     pass # Ignore errors setting cursor for now
+
 
                     except Exception as update_err:
-                        # Log detailed error including traceback if possible
                         logging.exception(f"Error inside update_output: {update_err}")
 
                 # --- Schedule UI Update ---
