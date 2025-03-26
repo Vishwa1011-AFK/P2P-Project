@@ -1,288 +1,278 @@
+# main.py
 import asyncio
 import logging
-import sys # Ensure sys is imported
-import os  # Ensure os is imported
-import websockets
+import sys
+import os
+import websockets  # Import the main library
+from typing import Optional
+
+# --- Core Application Imports ---
+from networking.config_manager import ConfigManager
+from networking.peer_manager import PeerManager
+from networking.transfer_manager import TransferManager
+from networking.ui_manager import UIManager
 from networking.discovery import PeerDiscovery
-from networking.messaging import (
-    user_input, # TUI runner task
-    receive_peer_messages,
-    handle_incoming_connection,
-    connections,
-    maintain_peer_list,
-    initialize_user_config,
-    # message_queue is handled internally by messaging now for display
-)
-from networking.file_transfer import update_transfer_progress
-from networking.shared_state import peer_usernames, peer_public_keys, shutdown_event, active_transfers
+from networking.connection import handle_incoming_connection, DEFAULT_PORT
+from networking.shared_state import shutdown_event
 
-# Configure logging
+# --- Logging Setup ---
 logging.basicConfig(
-    level=logging.INFO, # Adjust level (e.g., logging.DEBUG for more detail)
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", # Include logger name
-    # filename="p2p_app.log", # Optionally log to a file
-    # filemode="a",
-    stream=sys.stdout # Keep logging to stdout for terminal view
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)-8s] %(name)-25s: %(message)s",
+    stream=sys.stdout,
 )
-# Silence noisy libraries if needed
-# logging.getLogger("websockets").setLevel(logging.WARNING)
-
-# Get a logger instance for this module
+logging.getLogger("websockets").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
+# --- Global Manager Instances ---
+config_manager: Optional[ConfigManager] = None
+peer_manager: Optional[PeerManager] = None
+transfer_manager: Optional[TransferManager] = None
+ui_manager: Optional[UIManager] = None
+discovery: Optional[PeerDiscovery] = None
+# *** CORRECTED TYPE HINT for server ***
+server: Optional[websockets.Server] = None
 
-async def handle_peer_connection(websocket, path=None):
-    """Handle incoming WebSocket connections."""
-    peer_ip = websocket.remote_address[0]
-    logger.info(f"Incoming connection attempt from {peer_ip}")
+
+# *** CORRECTED TYPE HINT for websocket ***
+async def peer_connection_handler(websocket: websockets.WebSocketServerProtocol, path: Optional[str] = None):
+    """
+    Coroutine called by websockets.serve() for each new incoming connection.
+    Delegates handshake and subsequent message handling.
+    """
+    global config_manager, peer_manager, ui_manager, transfer_manager
+
+    peer_ip = "Unknown"
     try:
-        # handle_incoming_connection now performs the full handshake
-        success = await handle_incoming_connection(websocket, peer_ip)
-        if success:
-            # If handshake successful, start receiving messages
-            await receive_peer_messages(websocket, peer_ip)
-        else:
-             logger.warning(f"Handshake failed with {peer_ip}. Closing connection.")
-             # Ensure connection is closed if handshake fails but doesn't raise exception
+        peer_addr = websocket.remote_address
+        if peer_addr:
+            peer_ip = peer_addr[0]
+        logger.info(f"Incoming connection attempt from {peer_ip}")
+
+        if not all([config_manager, peer_manager, ui_manager, transfer_manager]):
+             logger.critical("Managers not initialized! Cannot handle connection.")
              if websocket.open:
-                 await websocket.close(code=1008, reason="Handshake failed")
+                 await websocket.close(code=1011, reason="Server setup error")
+             return
+
+        handshake_successful = await handle_incoming_connection(
+            websocket, peer_ip, config_manager, peer_manager, ui_manager, transfer_manager
+        )
+
+        if handshake_successful:
+            logger.info(f"Handshake with {peer_ip} successful. Connection active.")
+            # Receive loop task handles keeping connection alive
+            pass
+        else:
+             logger.warning(f"Handshake failed with {peer_ip}. Connection will be closed.")
+             if websocket.open:
+                 await websocket.close(code=1002, reason="Handshake failed")
 
     except websockets.exceptions.ConnectionClosed:
-         # Use debug level as this is common and expected during shutdown or normal disconnects
-         logger.debug(f"Connection closed by {peer_ip} (during/after handshake).")
+         logger.debug(f"Connection from {peer_ip} closed during initial handling.")
     except Exception as e:
-        logger.exception(f"Error handling connection from {peer_ip}: {e}")
-        # Ensure connection is closed on error
-        if websocket.open:
-            await websocket.close(code=1011, reason="Server error")
+        logger.exception(f"Error in peer_connection_handler for {peer_ip}: {e}")
+        if websocket and websocket.open:
+            try:
+                await websocket.close(code=1011, reason="Server error handling connection")
+            except Exception: pass
     finally:
-        # Cleanup is now handled more robustly within receive_peer_messages and handle_incoming_connection
-        logger.debug(f"Finished handling connection from {peer_ip}")
+        logger.debug(f"Finished peer_connection_handler for connection from {peer_ip}")
 
 
 async def main():
-    """Main application entry point."""
-    # Collect startup messages instead of queuing them immediately
-    startup_messages = []
+    """Main application entry point: Initializes managers, starts tasks, handles shutdown."""
+    global config_manager, peer_manager, transfer_manager, ui_manager, discovery, server
 
-    # Initialize config FIRST
-    # Note: initialize_user_config itself might queue messages for username prompt/load status
-    # We handle the main application start messages here.
-    await initialize_user_config()
-    logger.info("User configuration initialized.")
-    startup_messages.append("--- Starting P2P Application ---")
+    logger.info("--- Starting P2P Application ---")
+    tasks = []
+    main_task_exception = None
 
-    discovery = PeerDiscovery()
-
-    # --- Start Core Tasks (excluding input_task for now) ---
-    broadcast_task = asyncio.create_task(discovery.send_broadcasts(), name="BroadcastSender")
-    discovery_task = asyncio.create_task(discovery.receive_broadcasts(), name="BroadcastReceiver")
-    cleanup_task = asyncio.create_task(discovery.cleanup_stale_peers(), name="PeerCleanup")
-    progress_task = asyncio.create_task(update_transfer_progress(), name="TransferProgress")
-    maintain_task = asyncio.create_task(maintain_peer_list(discovery), name="PeerMaintainer")
-
-    # --- Start WebSocket Server ---
-    server = None
-    main_task_exception = None # Variable to store critical exceptions
-    input_task = None # Initialize input_task to None
-
+    # --- Ensure 'downloads' directory exists ---
     try:
+        downloads_dir = "downloads"
+        if not os.path.exists(downloads_dir):
+             os.makedirs(downloads_dir)
+             logger.info(f"Created '{downloads_dir}' directory.")
+        elif not os.path.isdir(downloads_dir):
+             logger.critical(f"'{downloads_dir}' exists but is not a directory! Exiting.")
+             print(f"[CRITICAL] '{downloads_dir}' exists but is not a directory!", file=sys.stderr)
+             sys.exit(1)
+    except OSError as e:
+          logger.critical(f"Error ensuring '{downloads_dir}' directory exists: {e}. Exiting.", exc_info=True)
+          print(f"[CRITICAL] Error creating '{downloads_dir}' directory: {e}", file=sys.stderr)
+          sys.exit(1)
+
+    # --- Main Application Logic ---
+    try:
+        # --- Initialize Managers ---
+        logger.debug("Initializing managers...")
+        temp_ui_queue_for_config = asyncio.Queue()
+        config_manager = ConfigManager(temp_ui_queue_for_config)
+        init_success = await config_manager.initialize()
+        if not init_success:
+             logger.critical("Failed to initialize user configuration. Exiting.")
+             while not temp_ui_queue_for_config.empty():
+                  try: print(temp_ui_queue_for_config.get_nowait())
+                  except asyncio.QueueEmpty: break
+             return
+
+        ui_manager = UIManager(config_manager, None, None, None)
+        config_manager.set_ui_queue(ui_manager.message_queue)
+
+        logger.debug("Draining temporary config message queue...")
+        while not temp_ui_queue_for_config.empty():
+             try:
+                  message = temp_ui_queue_for_config.get_nowait()
+                  await ui_manager.add_message(message)
+                  temp_ui_queue_for_config.task_done()
+             except asyncio.QueueEmpty: break
+             except Exception as drain_err:
+                  logger.error(f"Error draining temp config queue: {drain_err}")
+        logger.debug("Finished draining temporary queue.")
+
+        peer_manager = PeerManager(config_manager, ui_manager)
+        transfer_manager = TransferManager(peer_manager, ui_manager)
+        peer_manager.transfer_manager = transfer_manager
+        ui_manager.set_peer_manager(peer_manager)
+        ui_manager.set_transfer_manager(transfer_manager)
+        # Use a different port for discovery than for websocket connections
+        discovery_port = DEFAULT_PORT + 1
+        discovery = PeerDiscovery(broadcast_port=discovery_port)
+        ui_manager.discovery = discovery
+        logger.debug("Managers initialized successfully.")
+
+        # --- Start Core Background Tasks ---
+        logger.debug("Starting background tasks...")
+        tasks.append(asyncio.create_task(discovery.send_broadcasts(config_manager), name="BroadcastSender"))
+        tasks.append(asyncio.create_task(discovery.receive_broadcasts(), name="BroadcastReceiver"))
+        tasks.append(asyncio.create_task(discovery.cleanup_stale_peers(), name="PeerCleanup"))
+        tasks.append(asyncio.create_task(peer_manager.run_maintenance(discovery), name="PeerMaintainer"))
+        tasks.append(asyncio.create_task(transfer_manager.run_progress_updates(), name="TransferProgress"))
+        logger.debug(f"{len(tasks)} core background tasks started.")
+
+        # --- Start WebSocket Server ---
+        logger.debug(f"Starting WebSocket server on port {DEFAULT_PORT}...")
         server = await websockets.serve(
-            handle_peer_connection,
-            "0.0.0.0", # Listen on all interfaces
-            8765,
-            ping_interval=20, # Send pings every 20s
-            ping_timeout=20, # Disconnect if pong not received within 20s
-            close_timeout=10, # Time to wait for close handshake
-            max_size=None, # Allow large file transfers
+            peer_connection_handler,
+            "0.0.0.0", DEFAULT_PORT,
+            ping_interval=20, ping_timeout=20, close_timeout=10, max_size=None,
         )
-        server_addr = server.sockets[0].getsockname()
-        logger.info(f"WebSocket server started on {server_addr}")
-        startup_messages.append(f"--- Listening for peers on {server_addr[0]}:{server_addr[1]} ---")
-        startup_messages.append("--- Type /help for commands ---")
+        server_addr = server.sockets[0].getsockname() if server.sockets else ("Unknown", "N/A")
+        server_display_addr = f"{server_addr[0]}:{server_addr[1]}"
+        logger.info(f"WebSocket server started, listening on {server_display_addr}")
+        await ui_manager.add_message(f"--- Listening for peers on {server_display_addr} ---")
+        await ui_manager.add_message(f"--- Discovery running on UDP port {discovery_port} ---") # Inform user about discovery port
+        await ui_manager.add_message("--- Type /help for commands ---")
 
-        # --- Start Input Task *after* server is up and messages are ready ---
-        input_task = asyncio.create_task(
-            user_input(discovery, initial_messages=startup_messages), # Pass messages
-            name="UserInputTUI"
-        )
-
-        # List of all tasks to manage (now includes input_task)
-        tasks = [
-            broadcast_task,
-            discovery_task,
-            cleanup_task,
-            progress_task,
-            maintain_task,
-            input_task,
-        ]
+        # --- Start TUI Task ---
+        logger.debug("Starting TUI task...")
+        tui_task = asyncio.create_task(ui_manager.run_tui(), name="UIManagerTUI")
+        tasks.append(tui_task)
 
         # --- Wait for shutdown signal ---
-        logger.info("Main loop running. Waiting for commands or shutdown signal.")
+        logger.info("Application startup complete. Waiting for shutdown signal...")
         await shutdown_event.wait()
-        logger.info("Shutdown event received, proceeding to clean up.")
+        logger.info("Shutdown signal received, proceeding to cleanup.")
 
-
+    # --- Exception Handling for Startup/Main Loop ---
     except OSError as e:
-         # Specific handling for address in use
-         if "Address already in use" in str(e):
-              logger.critical(f"Failed to start WebSocket server: Port 8765 is already in use.")
-              # Try queueing message if messaging is set up, otherwise print
-              try:
-                   from networking.messaging import message_queue
-                   await message_queue.put("[CRITICAL] Cannot start server on port 8765. Is another instance running?")
-              except ImportError:
-                    print("[CRITICAL] Cannot start server on port 8765. Is another instance running?", file=sys.stderr)
+         if "Address already in use" in str(e) or (hasattr(e, 'errno') and e.errno == 98):
+              err_msg = f"[CRITICAL] Port {DEFAULT_PORT} already in use. Is another instance running?"
+              logger.critical(f"Failed to start WebSocket server: {err_msg}")
          else:
-              logger.critical(f"Failed to start WebSocket server due to OS error: {e}")
-              try:
-                   from networking.messaging import message_queue
-                   await message_queue.put(f"[CRITICAL] Cannot start server: {e}")
-              except ImportError:
-                   print(f"[CRITICAL] Cannot start server: {e}", file=sys.stderr)
-
-         main_task_exception = e
-         shutdown_event.set() # Trigger shutdown if server fails
-    except KeyboardInterrupt:
-        logger.info("Keyboard interrupt received. Shutting down...")
-        shutdown_event.set()
-    except asyncio.CancelledError:
-        logger.info("Main task cancelled. Shutting down...") # Should not happen unless externally cancelled
-        shutdown_event.set()
-    except Exception as e:
-         logger.exception(f"Unexpected error in main loop: {e}")
+              err_msg = f"[CRITICAL] Cannot start server due to OS error: {e}"
+              logger.critical(err_msg, exc_info=True)
+         if ui_manager: await ui_manager.add_message(err_msg)
+         else: print(err_msg, file=sys.stderr)
          main_task_exception = e
          shutdown_event.set()
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt received during startup/main loop. Initiating shutdown...")
+        shutdown_event.set()
+    except asyncio.CancelledError:
+        logger.info("Main task cancelled unexpectedly. Initiating shutdown...")
+        shutdown_event.set()
+    except Exception as e:
+         err_msg = f"Unexpected error in main execution: {e}"
+         logger.critical(err_msg, exc_info=True)
+         if ui_manager: await ui_manager.add_message(f"[CRITICAL ERROR] {err_msg}. Shutting down.")
+         else: print(f"[CRITICAL ERROR] {err_msg}. Shutting down.", file=sys.stderr)
+         main_task_exception = e
+         shutdown_event.set()
+
+    # --- Graceful Shutdown Sequence ---
     finally:
-        logger.info("Initiating shutdown process...")
+        logger.info("--- Initiating Application Shutdown ---")
         if not shutdown_event.is_set():
-             logger.warning("Shutdown initiated without shutdown_event being set. Setting now.")
-             shutdown_event.set() # Ensure event is set
+             logger.warning("Shutdown sequence entered but shutdown_event was not set. Setting now.")
+             shutdown_event.set()
 
-        # --- Graceful Shutdown ---
-        logger.info("Cancelling all running tasks...")
-        # Construct the list of tasks to cancel *within* the finally block
-        # This ensures input_task is included if it was successfully created
-        all_tasks_to_cancel = [
-            task for task in [
-                broadcast_task, discovery_task, cleanup_task,
-                progress_task, maintain_task, input_task # input_task might be None if server failed early
-            ] if task is not None # Filter out None tasks
-        ]
+        # 1. Stop Server & Signal Tasks
+        logger.debug("Closing server and signalling tasks...")
+        if server: server.close()
+        if ui_manager: ui_manager.stop()
+        if discovery: discovery.stop()
 
-        for task in all_tasks_to_cancel:
-             # Check if task is not done before cancelling
-             if not task.done():
-                 task.cancel()
-                 logger.debug(f"Cancelled task: {task.get_name()}")
+        # 2. Cancel & Wait for Tasks
+        logger.info(f"Cancelling background tasks...")
+        # Use current tasks list, filter out None or already done tasks
+        tasks_to_cancel = [t for t in tasks if t and not t.done()]
+        logger.info(f"Attempting to cancel {len(tasks_to_cancel)} running tasks.")
+        for task in tasks_to_cancel: task.cancel()
 
-        # Wait for tasks to finish cancellation (with timeout)
-        logger.info("Waiting for tasks to finish...")
-        results = []
-        if all_tasks_to_cancel: # Only gather if there are tasks to cancel
-            try:
-                results = await asyncio.wait_for(
-                    asyncio.gather(*all_tasks_to_cancel, return_exceptions=True),
-                    timeout=5.0 # Adjust timeout as needed (e.g., 5-10 seconds)
-                )
-            except asyncio.TimeoutError:
-                logger.warning("Timed out waiting for tasks to cancel. Some tasks may not have finished cleanly.")
-                # Check tasks status again after timeout
-                for i, task in enumerate(all_tasks_to_cancel):
-                    if task and not task.done():
-                        task_name = task.get_name() if hasattr(task, 'get_name') else f"Task_{i}"
-                        logger.error(f"Task {task_name} did not cancel in time.")
-            except Exception as gather_ex:
-                 logger.error(f"Error during task gathering on shutdown: {gather_ex}")
+        if tasks_to_cancel:
+            logger.info(f"Waiting up to 5 seconds for {len(tasks_to_cancel)} tasks to finish...")
+            done, pending = await asyncio.wait(tasks_to_cancel, timeout=5.0, return_when=asyncio.ALL_COMPLETED)
+            if pending:
+                 logger.warning(f"{len(pending)} tasks did not finish cancellation in time:")
+                 for task in pending: logger.warning(f"  - Task pending: {task.get_name()}")
+            for task in done:
+                 try: task.result()
+                 except asyncio.CancelledError: logger.debug(f"Task {task.get_name()} completed cancellation.")
+                 except Exception as task_ex:
+                      if task_ex is not main_task_exception:
+                           logger.error(f"Task {task.get_name()} raised exception: {task_ex!r}", exc_info=False)
         else:
-             logger.info("No tasks were running to wait for.")
+            logger.info("No running background tasks needed cancellation.")
 
-
-        if results: # Check if results were obtained (not timed out)
-            for i, result in enumerate(results):
-                # Need to handle potential index errors if gather timed out partially
-                if i < len(all_tasks_to_cancel):
-                    task_ref = all_tasks_to_cancel[i]
-                    task_name = task_ref.get_name() if task_ref else f"Task_{i}"
-
-                    if isinstance(result, asyncio.CancelledError):
-                        logger.debug(f"Task {task_name} finished cancellation.")
-                    elif isinstance(result, Exception):
-                        # Log exceptions raised *during cancellation* or if task failed before cancellation
-                        if result is not main_task_exception:
-                             if isinstance(result, Exception) and str(result) == "EXIT_APP_SIGNAL":
-                                  logger.debug(f"Task {task_name} exited via signal.")
-                             else:
-                                  # Log exceptions from tasks other than the one causing shutdown
-                                  logger.error(f"Task {task_name} raised exception during processing/shutdown: {result!r}")
-
-        # Close WebSocket server
+        # 3. Wait for Server Close
         if server:
-            logger.info("Closing WebSocket server...")
-            server.close()
+            logger.info("Waiting for WebSocket server to close completely...")
             try:
-                await asyncio.wait_for(server.wait_closed(), timeout=2.0)
+                await asyncio.wait_for(server.wait_closed(), timeout=3.0)
                 logger.info("WebSocket server closed.")
-            except asyncio.TimeoutError:
-                 logger.warning("Timed out waiting for WebSocket server to close.")
-            except Exception as server_close_ex:
-                 logger.error(f"Error closing WebSocket server: {server_close_ex}")
+            except asyncio.TimeoutError: logger.warning("Timed out waiting for WebSocket server to close.")
+            except Exception as ex: logger.error(f"Error waiting for server close: {ex}")
+
+        # 4. Final Peer Cleanup (Safety Net)
+        if peer_manager:
+             connected_peers = peer_manager.get_all_connected_peers()
+             if connected_peers:
+                  logger.info(f"Closing {len(connected_peers)} remaining peer connections...")
+                  disconnect_tasks = [peer_manager.remove_peer(ip, "Server shutting down") for _, ip in connected_peers]
+                  try:
+                      await asyncio.wait_for(asyncio.gather(*disconnect_tasks, return_exceptions=True), timeout=5.0)
+                  except asyncio.TimeoutError: logger.warning("Timed out final peer cleanup.")
+                  except Exception as ex: logger.error(f"Error during final peer cleanup: {ex}")
+             # Clear manager state after attempting closure
+             if hasattr(peer_manager, '_connections'): peer_manager._connections.clear()
+             if hasattr(peer_manager, '_peer_public_keys'): peer_manager._peer_public_keys.clear()
+             if hasattr(peer_manager, '_peer_usernames'): peer_manager._peer_usernames.clear()
 
 
-        # Close all remaining peer connections (should be handled by receive loops, but as fallback)
-        logger.info("Closing any remaining peer connections...")
-        for peer_ip, websocket in list(connections.items()):
-            try:
-                if websocket.open:
-                    # Use code 1001 (Going Away) for graceful shutdown
-                    await websocket.close(code=1001, reason="Server shutting down")
-                    logger.debug(f"Closed connection to {peer_ip}")
-            except Exception as e:
-                logger.error(f"Error closing connection to {peer_ip} during shutdown: {e}")
-        connections.clear()
-        peer_public_keys.clear()
-        peer_usernames.clear()
+        logger.info("--- Application Shutdown Complete ---")
 
-        # Stop discovery explicitly (stops broadcast socket)
-        logger.info("Stopping discovery...")
-        if 'discovery' in locals() and hasattr(discovery, 'stop'):
-             discovery.stop() # Call the stop method on the discovery instance
-
-        # Close any remaining file handles in active transfers
-        logger.info("Cleaning up file transfers...")
-        for transfer_id, transfer in list(active_transfers.items()):
-            if transfer.file_handle and not transfer.file_handle.closed:
-                try:
-                    await transfer.file_handle.close()
-                    logger.debug(f"Closed file handle for transfer {transfer_id} during shutdown")
-                except Exception as e:
-                     logger.error(f"Error closing file handle for transfer {transfer_id} during shutdown: {e}")
-        active_transfers.clear()
-
-        logger.info("Application shutdown complete.")
-        # The asyncio event loop stops automatically when run with asyncio.run()
-
+# --- Application Entry Point ---
 if __name__ == "__main__":
-    # Ensure downloads directory exists before any async code runs
-    if not os.path.exists("downloads"):
-         try:
-              os.makedirs("downloads")
-              print("Created 'downloads' directory.")
-         except OSError as e:
-              print(f"Error creating 'downloads' directory: {e}", file=sys.stderr)
-              sys.exit(1)
-
     try:
-        # Note: asyncio.run() handles loop creation and closing
         asyncio.run(main())
     except KeyboardInterrupt:
-        # This handles interrupt if it happens *before* the main async loop starts
-        print("\nShutdown requested before main loop started.")
+        logger.info("\nKeyboardInterrupt caught outside main loop. Exiting.")
+        print("\nApplication interrupted.")
     except Exception as e:
-        print(f"\nUnexpected critical error during application execution: {e}", file=sys.stderr)
-        # Optionally print traceback for debugging
-        import traceback
-        traceback.print_exc()
+        logger.critical(f"Critical error during application lifecycle: {e}", exc_info=True)
+        print(f"\n[CRITICAL ERROR] Application failed: {e}", file=sys.stderr)
         sys.exit(1)
     finally:
          print("Application has exited.")
