@@ -1171,37 +1171,30 @@ async def user_input(discovery, initial_messages=None): # Added initial_messages
                 # Prepare message string for display based on item type
                 display_text = ""
                 # Reset approval flags by default, set them if item is an approval request
-                is_approval_request = False
+                is_approval_request = False # Flag remains for clarity, though not used in update_output directly now
                 temp_conn_ip = None
                 temp_file_id = None
 
                 if isinstance(item, dict):
                     msg_type = item.get("type")
                     if msg_type == "ui_file_approval_request":
-                        # Set temporary approval state for this message
                         temp_file_id = item["transfer_id"]
-                        # Format the approval request text
                         peer_username = item["peer_username"]
                         relative_path = item["relative_path"]
                         file_size = item["file_size"]
                         display_text = f"❓ File request from {peer_username}: '{relative_path}' ({file_size} bytes). Accept? (yes/no)"
                         is_approval_request = True
                     elif msg_type == "ui_connection_approval_request":
-                        # Set temporary approval state for this message
                         temp_conn_ip = item["peer_ip"]
-                        # Format the approval request text
                         peer_ip = item["peer_ip"]
                         requesting_username = item["requesting_username"]
                         display_text = f"❓ Connection request from {requesting_username} ({peer_ip}). Accept? (yes/no)"
                         is_approval_request = True
                     else:
-                         # Fallback for other dictionary types received
                          display_text = f"[System Dict]: {item}"
                 elif isinstance(item, str):
-                    # Handle plain string messages
                     display_text = f"{item}"
                 else:
-                    # Handle unexpected types in the queue
                     display_text = f"[System Unknown Type]: {type(item).__name__}"
 
                 # --- Safely update TUI output area ---
@@ -1212,125 +1205,95 @@ async def user_input(discovery, initial_messages=None): # Added initial_messages
                         # Update global approval state *only if* this message is an approval request
                         if set_conn_ip:
                              current_connection_approval_ip = set_conn_ip
-                             current_file_approval_id = None # Clear other approval type
+                             current_file_approval_id = None
                              logging.debug(f"Set pending connection approval for IP: {set_conn_ip}")
                         elif set_file_id:
                              current_file_approval_id = set_file_id
-                             current_connection_approval_ip = None # Clear other approval type
+                             current_connection_approval_ip = None
                              logging.debug(f"Set pending file approval for ID: {set_file_id}")
-                        # If not an approval request, the global state remains as it was
 
-                        # Check if output area is currently empty before adding newline
+                        # <<< MODIFIED Newline Logic >>>
+                        # Add a newline before the new message ONLY if the output area already has content.
                         prefix = "\n" if output_area.text else ""
-                        # Add display text (strip any accidental leading newline from formatting)
-                        new_text_content = output_area.text + prefix + text_to_add.lstrip('\n')
+                        new_text_content = output_area.text + prefix + text_to_add # Add the message directly
 
-                        # Limit buffer size to prevent excessive memory use (optional)
-                        max_lines = 1000 # Adjust as needed
+                        # Limit buffer size
+                        max_lines = 1000
                         lines = new_text_content.split('\n')
                         if len(lines) > max_lines:
-                            # Keep the last 'max_lines' lines
                             new_text_content = '\n'.join(lines[-max_lines:])
 
                         # Update the widget's text attribute directly
                         output_area.text = new_text_content
 
                     except Exception as update_err:
-                         # Log errors occurring within the threadsafe call context
                          logging.error(f"Error inside update_output: {update_err}")
 
                 # --- Schedule UI Update ---
-                # Check if the TUI application object is currently running
                 if tui_app.is_running:
-                     # Get the application's event loop
                      loop = get_app().loop
-                     # Schedule the UI update function to run in the application's thread
                      loop.call_soon_threadsafe(update_output, display_text, temp_conn_ip, temp_file_id)
-                     # Schedule a redraw of the application
                      loop.call_soon_threadsafe(tui_app.invalidate)
                 else:
-                    # Fallback if TUI isn't running (e.g., very early messages before run_async starts fully)
-                    # This path is less critical now with initial_messages, but kept as safety
-                    prefix = "\n" if output_area.text else ""
-                    output_area.text += prefix + display_text.lstrip('\n')
-                    logging.debug(f"TUI not running, appended message directly: {display_text}")
+                     # Fallback if TUI isn't running
+                     prefix = "\n" if output_area.text else ""
+                     output_area.text += prefix + display_text
+                     logging.debug(f"TUI not running, appended message directly: {display_text}")
 
-                # Mark the queued item as processed
                 message_queue.task_done()
 
             except asyncio.CancelledError:
-                # Log cancellation and break the loop
                 logging.info("Display messages task cancelled.")
                 break
             except Exception as e:
-                # Log unexpected errors in the display loop
                 logging.exception(f"Error in display_messages loop: {e}")
-                # Avoid tight loop on continuous errors
                 await asyncio.sleep(1)
 
     # --- Start the Background Display Task ---
-    # Create and start the task that handles reading the queue and updating the UI
     display_task = asyncio.create_task(display_messages(), name="MessageDisplay")
 
     # --- Main TUI Interaction Loop ---
+    # (The rest of the user_input function remains the same as the previous complete version)
     try:
-        # Loop indefinitely until shutdown is triggered
         while not shutdown_event.is_set():
-            # Run the prompt_toolkit application asynchronously.
-            # It waits for user input and returns the text when Enter is pressed
-            # (due to the accept_handler lambda function in input_area setup).
             input_text = await tui_app.run_async()
 
-            # After run_async returns, check if shutdown was triggered
-            # or if a special signal was received from keybindings (like Ctrl+C)
             if shutdown_event.is_set() or input_text == "EXIT_APP_SIGNAL":
                  if shutdown_event.is_set():
                       logging.debug("Shutdown event set while TUI was waiting for input or processing.")
                  else:
                       logging.debug("TUI exit signal received.")
-                 break # Exit the while loop to proceed to finally block
+                 break
 
-            # If not shutting down, process the valid input text received
-            # handle_input will set shutdown_event if the command was /exit
             await handle_input(input_text, discovery)
 
     except asyncio.CancelledError:
-         # This task itself was cancelled (likely during shutdown)
          logging.info("User input task cancelled.")
     except EOFError:
-        # Handle Ctrl+D if pressed when input is focused (might be caught by bindings too)
         logging.info("EOF received, initiating shutdown.")
-        # Ensure message queue is used if possible, otherwise print
         try:
             await message_queue.put("EOF received, shutting down...")
-        except Exception: # Catch potential errors if queue is broken during shutdown
+        except Exception:
             print("EOF received, shutting down...")
         shutdown_event.set()
     except Exception as e:
-         # Catch any other unexpected errors in the TUI loop itself
          logging.exception(f"Error in user_input TUI loop: {e}")
-         shutdown_event.set() # Trigger shutdown on critical TUI error
+         shutdown_event.set()
     finally:
-        # --- Cleanup for the user_input task ---
         logging.info("Exiting user input TUI loop.")
-
-        # Ensure the background display task is cancelled
         if display_task and not display_task.done():
             display_task.cancel()
             try:
-                # Wait briefly for the display_task to finish cancellation
                 await asyncio.wait_for(display_task, timeout=1.0)
             except asyncio.CancelledError:
-                pass # Expected outcome of cancellation
+                pass
             except asyncio.TimeoutError:
                  logging.warning("Timed out waiting for display_task to cancel.")
             except Exception as display_cancel_err:
                  logging.error(f"Error occurred while cancelling display_task: {display_cancel_err}")
 
-        # Ensure the prompt_toolkit application is stopped if it's somehow still running
         if tui_app.is_running:
              try:
                   tui_app.exit()
              except Exception as app_exit_err:
-                  # Ignore errors if it's already exiting or fails during shutdown
                   logging.debug(f"Exception during tui_app.exit() in finally block: {app_exit_err}")
