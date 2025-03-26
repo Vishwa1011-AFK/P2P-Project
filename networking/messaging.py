@@ -19,7 +19,8 @@ from networking.shared_state import (
 from networking.file_transfer import send_file, send_folder, FileTransfer, TransferState
 from websockets.connection import State as WebSocketState # Rename to avoid confusion
 from appdirs import user_config_dir
-
+from websockets.protocol import WebSocketCommonProtocol
+from websockets.connection import State as WebSocketState
 # --- TUI Setup ---
 from prompt_toolkit import Application, print_formatted_text
 from prompt_toolkit.layout import Layout, HSplit, Window
@@ -29,6 +30,8 @@ from prompt_toolkit.completion import WordCompleter, Completer, Completion
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.formatted_text import FormattedText
+from prompt_toolkit.document import Document
+
 
 # Global state for TUI and Approvals
 peer_list = {}  # {ip: (username, last_seen)} - Maintained by maintain_peer_list
@@ -535,23 +538,29 @@ async def send_message_to_peers(message_content, target_username=None):
         if not peer_ip:
             await message_queue.put(f"Error: No peer named '{target_username}' connected.")
             return False
-        if peer_ip not in connections or not connections[peer_ip].open:
-            await message_queue.put(f"Error: Connection to '{target_username}' is closed.")
+        websocket = connections.get(peer_ip) # Use .get() for safety
+        if not isinstance(websocket, WebSocketCommonProtocol) or not websocket.open:
+            await message_queue.put(f"Error: Connection to '{target_username}' is invalid or closed.")
             # Cleanup inconsistent state if necessary
             if peer_ip in connections: del connections[peer_ip]
             if peer_ip in peer_public_keys: del peer_public_keys[peer_ip]
             if target_username in peer_usernames: del peer_usernames[target_username]
             return False
-        if peer_ip not in peer_public_keys:
-             await message_queue.put(f"Error: Missing public key for '{target_username}'. Cannot encrypt.")
-             return False
-        peers_to_send[peer_ip] = connections[peer_ip]
+        peers_to_send[peer_ip] = websocket
     else:
         # Send to all connected peers
-        peers_to_send = {ip: ws for ip, ws in connections.items() if ws.open}
-        if not peers_to_send:
-             await message_queue.put("No peers connected to send message.")
-             return False
+        valid_peers_to_send = {}
+        for ip, ws in connections.items():
+            # Check if it's a valid websocket object AND is open
+            if isinstance(ws, WebSocketCommonProtocol) and ws.open:
+                valid_peers_to_send[ip] = ws
+            else:
+                # Log if we find an invalid entry - helps debugging
+                logging.warning(f"Found invalid or closed connection object for IP {ip} in connections dict during broadcast prep.")
+        peers_to_send = valid_peers_to_send # Use the filtered dict
+        if not peers_to_send and target_username is None: # Check if broadcast target is now empty
+            await message_queue.put("No valid, open peer connections to send message.")
+            return False
 
     sent_count = 0
     failed_peers = []
@@ -981,10 +990,10 @@ yes / no                - Respond to connection or file transfer requests.
                   await message_queue.put(f"Error: Peer '{target_username}' is not connected.")
                   return
              websocket = connections.get(peer_ip)
-             if not websocket or not websocket.open:
-                  await message_queue.put(f"Error: Connection to '{target_username}' is closed.")
-                  # Consider cleanup? maintain_peer_list should handle it.
-                  return
+             if not isinstance(websocket, WebSocketCommonProtocol) or not websocket.open:
+                await message_queue.put(f"Error: Connection to '{target_username}' is invalid or closed.")
+                # Optional cleanup like in send_message_to_peers if needed here too
+                return
 
              item_path_abs = os.path.abspath(item_path) # Use absolute path
 
@@ -1199,35 +1208,64 @@ async def user_input(discovery, initial_messages=None): # Added initial_messages
 
                 # --- Safely update TUI output area ---
                 def update_output(text_to_add, set_conn_ip, set_file_id):
-                    """Nested function to perform the actual UI update."""
+                    """Nested function to perform the actual UI update more efficiently."""
                     global current_connection_approval_ip, current_file_approval_id
                     try:
-                        # Update global approval state *only if* this message is an approval request
+                        # --- Update global approval state (same as before) ---
                         if set_conn_ip:
-                             current_connection_approval_ip = set_conn_ip
-                             current_file_approval_id = None
-                             logging.debug(f"Set pending connection approval for IP: {set_conn_ip}")
+                            current_connection_approval_ip = set_conn_ip
+                            current_file_approval_id = None
+                            logging.debug(f"Set pending connection approval for IP: {set_conn_ip}")
                         elif set_file_id:
-                             current_file_approval_id = set_file_id
-                             current_connection_approval_ip = None
-                             logging.debug(f"Set pending file approval for ID: {set_file_id}")
+                            current_file_approval_id = set_file_id
+                            current_connection_approval_ip = None
+                            logging.debug(f"Set pending file approval for ID: {set_file_id}")
+                        # --- End Approval State Update ---
 
-                        # <<< MODIFIED Newline Logic >>>
-                        # Add a newline before the new message ONLY if the output area already has content.
-                        prefix = "\n" if output_area.text else ""
-                        new_text_content = output_area.text + prefix + text_to_add # Add the message directly
+                        # --- Efficiently Append Text and Scroll ---
+                        # Get the buffer associated with the output area
+                        buffer = output_area.buffer
 
-                        # Limit buffer size
-                        max_lines = 1000
-                        lines = new_text_content.split('\n')
-                        if len(lines) > max_lines:
-                            new_text_content = '\n'.join(lines[-max_lines:])
+                        # Check if we need a newline before appending
+                        # Add newline if buffer isn't empty AND doesn't already end with newline
+                        prefix = ""
+                        if buffer.text and not buffer.text.endswith('\n'):
+                            prefix = "\n"
 
-                        # Update the widget's text attribute directly
-                        output_area.text = new_text_content
+                        # Prepare the full text to insert (prefix + new message)
+                        text_to_insert = prefix + text_to_add
+
+                        # Move cursor to the end of the buffer *before* inserting
+                        buffer.cursor_position = len(buffer.text)
+
+                        # Insert the new text at the current cursor position (which is the end)
+                        buffer.insert_text(text_to_insert)
+
+                        # --- Limit Buffer Lines (Optional but recommended) ---
+                        max_lines = 1000 # Adjust as needed
+                        if buffer.line_count > max_lines:
+                            # Calculate how many lines to delete from the beginning
+                            lines_to_delete = buffer.line_count - max_lines
+                            # Get the character position at the end of the lines to delete
+                            delete_until_pos = buffer.document.translate_row_col_to_index(lines_to_delete, 0)
+                            # Create a change object to delete text from start to that position
+                            # Note: This API might need adjustment based on prompt_toolkit version specifics
+                            # A simpler, though potentially less performant way if the above is complex:
+                            current_lines = buffer.text.split('\n')
+                            new_text = '\n'.join(current_lines[-max_lines:])
+                            # Reset the entire buffer text if limiting is needed
+                            buffer.reset(initial_document=Document(text=new_text, cursor_position=len(new_text)))
+                        else:
+                            # Ensure cursor is at the very end after insertion if no lines were deleted
+                            buffer.cursor_position = len(buffer.text)
+                        # --- End Buffer Limiting ---
+
+                        # No need to manually set output_area.text, buffer manipulation handles it.
+                        # The invalidate call later will trigger the redraw with the updated buffer.
 
                     except Exception as update_err:
-                         logging.error(f"Error inside update_output: {update_err}")
+                        # Log detailed error including traceback if possible
+                        logging.exception(f"Error inside update_output: {update_err}")
 
                 # --- Schedule UI Update ---
                 if tui_app.is_running:
