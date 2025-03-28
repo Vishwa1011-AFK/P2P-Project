@@ -46,7 +46,7 @@ async def main():
     cleanup_task = asyncio.create_task(discovery.cleanup_stale_peers())
     progress_task = asyncio.create_task(update_transfer_progress())
     maintain_task = asyncio.create_task(maintain_peer_list(discovery))
-    input_task = asyncio.create_task(user_input(discovery))
+    input_task = asyncio.create_task(user_input(discovery)) # Pass discovery instance
     display_task = asyncio.create_task(display_messages())
 
     # Start WebSocket server
@@ -55,7 +55,7 @@ async def main():
         "0.0.0.0",
         8765,
         ping_interval=None,
-        max_size=None,
+        max_size=10 * 1024 * 1024,  # Set max_size to 10MB (CHANGE APPLIED HERE)
     )
     logging.info("WebSocket server started")
 
