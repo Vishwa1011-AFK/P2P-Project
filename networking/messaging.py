@@ -10,6 +10,8 @@ from aioconsole import ainput
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey, RSAPrivateKey
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.exceptions import InvalidSignature, InvalidKey, UnsupportedAlgorithm, AlreadyFinalized, NotYetFinalized
 from networking.utils import get_own_ip
 from networking.shared_state import (
     active_transfers, message_queue, connections, user_data, peer_public_keys,
@@ -116,8 +118,15 @@ async def initialize_user_config():
             user_data["public_key"] = serialization.load_pem_public_key(user_data["public_key"].encode())
             user_data["private_key"] = serialization.load_pem_private_key(user_data["private_key"].encode(), password=None)
             print(f"Welcome back, {get_own_display_name()}!")
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError, UnsupportedAlgorithm) as e:
+             print(f"Error loading config file ({config_file_path}): {e}. Creating a new one.")
+             await create_new_user_config(config_file_path)
+        except OSError as e:
+             print(f"OS error loading config file ({config_file_path}): {e}. Creating a new one.")
+             await create_new_user_config(config_file_path)
         except Exception as e:
-            print(f"Error loading config, creating new one: {e}")
+            logging.exception(f"Unexpected error loading config file {config_file_path}: {e}")
+            print(f"Unexpected error loading config, creating new one: {e}")
             await create_new_user_config(config_file_path)
     else:
         await create_new_user_config(config_file_path)
@@ -130,38 +139,41 @@ async def create_new_user_config(config_file_path, username=None):
     else:
         original_username = username
 
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    public_key = private_key.public_key()
-    device_id = str(uuid.uuid4())
-
-    user_data.clear()
-    user_data.update({
-        "original_username": original_username,
-        "public_key": public_key,
-        "private_key": private_key,
-        "device_id": device_id
-    })
-
-    data_to_save = {
-        "original_username": original_username,
-        "public_key": public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
-        ).decode(),
-        "private_key": private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption()
-        ).decode(),
-        "device_id": device_id
-    }
-
     try:
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        public_key = private_key.public_key()
+        device_id = str(uuid.uuid4())
+
+        user_data.clear()
+        user_data.update({
+            "original_username": original_username,
+            "public_key": public_key,
+            "private_key": private_key,
+            "device_id": device_id
+        })
+
+        data_to_save = {
+            "original_username": original_username,
+            "public_key": public_key.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            ).decode(),
+            "private_key": private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption()
+            ).decode(),
+            "device_id": device_id
+        }
         with open(config_file_path, "w") as f:
             json.dump(data_to_save, f, indent=4)
-    except IOError as e:
+    except (OSError, IOError) as e:
         logging.error(f"Failed to save config file {config_file_path}: {e}")
         print(f"Error: Could not save configuration file.")
+        # Maybe exit here if config cannot be saved?
+    except Exception as e:
+         logging.exception(f"Unexpected error creating config file {config_file_path}: {e}")
+         print(f"Error: Unexpected issue creating configuration.")
 
 
 async def connect_to_peer(peer_ip, requesting_username_ignored, target_username, port=8765):
@@ -237,21 +249,33 @@ async def connect_to_peer(peer_ip, requesting_username_ignored, target_username,
     except websockets.exceptions.InvalidURI:
          print(f"Connection to {target_username} failed: Invalid URI '{uri}'")
          return None
-    except (websockets.exceptions.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK):
+    except (websockets.exceptions.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK) as e:
+        logging.warning(f"Connection closed during handshake with {peer_ip}: {e}")
         print(f"Connection to {target_username} closed unexpectedly during handshake.")
         if websocket and websocket.state != State.CLOSED: await websocket.close()
         return None
     except ConnectionRefusedError:
-        print(f"Connection to {target_username} ({peer_ip}) refused.")
+        print(f"Connection to {target_username} ({peer_ip}) refused by peer.")
         if websocket and websocket.state != State.CLOSED: await websocket.close()
         return None
     except OSError as e:
+         logging.warning(f"OS error connecting to {peer_ip}: {e}")
          print(f"Connection to {target_username} failed: Network error ({e})")
          if websocket and websocket.state != State.CLOSED: await websocket.close()
          return None
-    except Exception as e:
-        logging.exception(f"Failed to connect to {peer_ip}: {e}")
-        print(f"Connection to {target_username} failed: {str(e)}")
+    except json.JSONDecodeError as e:
+        logging.error(f"Invalid JSON received during handshake with {peer_ip}: {e}")
+        print(f"Connection to {target_username} failed: Invalid data received.")
+        if websocket and websocket.state == State.OPEN: await websocket.close(code=1007)
+        return None
+    except asyncio.TimeoutError:
+         logging.warning(f"Connection attempt to {peer_ip} timed out.")
+         print(f"Connection attempt to {target_username} timed out.")
+         if websocket and websocket.state != State.CLOSED: await websocket.close()
+         return None
+    except Exception as e: # Catch-all for truly unexpected errors
+        logging.exception(f"Unexpected error connecting to {peer_ip}: {e}")
+        print(f"Connection to {target_username} failed: Unexpected error ({type(e).__name__})")
         if websocket and websocket.state != State.CLOSED:
             await websocket.close()
         return None
@@ -297,14 +321,9 @@ async def disconnect_from_peer(target_identifier):
 
             await websocket.close()
             print(f"Disconnected from {display_name_disconnecting}")
-        except Exception as e:
-            logging.error(f"Error disconnecting from {display_name_disconnecting}: {e}")
-            print(f"Failed to cleanly disconnect from {display_name_disconnecting}: {e}")
-            if peer_ip_to_disconnect in connections: del connections[peer_ip_to_disconnect]
-            if peer_ip_to_disconnect in peer_public_keys: del peer_public_keys[peer_ip_to_disconnect]
-            if peer_ip_to_disconnect in peer_device_ids: del peer_device_ids[peer_ip_to_disconnect]
-            if original_username and original_username in peer_usernames and peer_usernames[original_username] == peer_ip_to_disconnect:
-                del peer_usernames[original_username]
+        except Exception as e: # Catch broad exception during close, as state is already cleaned
+            logging.error(f"Error during websocket close for {display_name_disconnecting}: {e}")
+            print(f"Error closing connection to {display_name_disconnecting}: {e}")
 
 
 async def handle_incoming_connection(websocket, peer_ip):
@@ -418,12 +437,17 @@ async def handle_incoming_connection(websocket, peer_ip):
         if websocket and websocket.state == State.OPEN:
             await websocket.close(code=1007, reason="Invalid JSON")
         return False
-    except (websockets.exceptions.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK):
+    except websockets.exceptions.ConnectionClosed:
         logging.info(f"Connection closed by {peer_ip} during handshake.")
         if peer_ip in pending_approvals: del pending_approvals[peer_ip]
         return False
-    except Exception as e:
-        logging.exception(f"Error in connection handshake with {peer_ip}: {e}")
+    except asyncio.TimeoutError: # Catch timeout during recv
+         logging.warning(f"Timeout waiting for message from {peer_ip} during handshake.")
+         if websocket and websocket.state != State.CLOSED: await websocket.close()
+         if peer_ip in pending_approvals: del pending_approvals[peer_ip]
+         return False
+    except Exception as e: # Catch-all for unexpected handshake errors
+        logging.exception(f"Unexpected error in connection handshake with {peer_ip}: {e}")
         if websocket and websocket.state == State.OPEN:
             await websocket.close(code=1011, reason="Internal server error")
         if peer_ip in pending_approvals: del pending_approvals[peer_ip]
@@ -437,9 +461,9 @@ async def maintain_peer_list(discovery_instance):
                 if shutdown_event.is_set(): break
                 try:
                     await asyncio.wait_for(ws.ping(), timeout=10.0)
-                except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
+                except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed) as ping_err:
                     lost_display_name = get_peer_display_name(peer_ip)
-                    logging.warning(f"Connection lost with peer {lost_display_name} ({peer_ip}). Cleaning up.")
+                    logging.warning(f"Connection lost with {lost_display_name} ({peer_ip}): {type(ping_err).__name__}. Cleaning up.")
 
                     lost_original_username = get_peer_original_username(peer_ip)
 
@@ -449,17 +473,19 @@ async def maintain_peer_list(discovery_instance):
                     if lost_original_username and lost_original_username in peer_usernames and peer_usernames[lost_original_username] == peer_ip:
                          del peer_usernames[lost_original_username]
 
+                    await cleanup_transfers_for_peer(peer_ip, lost_display_name)
                     await message_queue.put(f"Disconnected from {lost_display_name} (connection lost)")
 
                     if ws.state != State.CLOSED:
-                        await ws.close()
+                        try: await ws.close()
+                        except Exception: pass # Ignore errors during cleanup close
 
             await asyncio.sleep(15)
         except asyncio.CancelledError:
             logging.info("maintain_peer_list task cancelled.")
             break
-        except Exception as e:
-            logging.exception(f"Error in maintain_peer_list: {e}")
+        except Exception as e: # Broad catch for the background task loop
+            logging.exception(f"Error in maintain_peer_list loop: {e}")
             await asyncio.sleep(15)
     logging.info("maintain_peer_list exited.")
 
@@ -503,7 +529,14 @@ async def send_message_to_peers(message, peer_ip=None):
             payload = json.dumps({"type": "MESSAGE", "message": encrypted_message})
             await websocket.send(payload)
             sent_to_at_least_one = True
-        except Exception as e:
+        except (ValueError, TypeError) as crypto_err: # More specific crypto errors
+             logging.error(f"Encryption error sending message to {display_name} ({target_ip}): {crypto_err}")
+             await message_queue.put(f"Error encrypting message for {display_name}.")
+        except websockets.exceptions.ConnectionClosed:
+             logging.warning(f"Connection closed while sending message to {display_name} ({target_ip}).")
+             await message_queue.put(f"Error sending message to {display_name}: Connection closed.")
+             # Consider triggering disconnect logic here? maintain_peer_list should catch it.
+        except Exception as e: # Catch other send errors (e.g., OS errors)
             logging.error(f"Failed to send message to {display_name} ({target_ip}): {e}")
             await message_queue.put(f"Error sending message to {display_name}: {e}")
 
@@ -512,153 +545,200 @@ async def send_message_to_peers(message, peer_ip=None):
 
 async def receive_peer_messages(websocket, peer_ip):
     peer_display_name = f"Peer@{peer_ip}"
+    current_receiving_transfer_id = None # Track active transfer for binary data
+
     try:
         peer_display_name = get_peer_display_name(peer_ip)
 
         async for message in websocket:
-            if shutdown_event.is_set():
-                break
+            if shutdown_event.is_set(): break
+
             try:
-                data = json.loads(message)
-                message_type = data.get("type")
+                data = None
+                is_binary = isinstance(message, bytes)
 
-                peer_display_name = get_peer_display_name(peer_ip)
-
-                if message_type == "file_transfer_init":
-                    transfer_id = data["transfer_id"]
-                    file_name = data["filename"]
-                    file_size = data["filesize"]
-                    expected_hash = data.get("file_hash")
-                    safe_filename_base = os.path.basename(file_name)
-                    download_dir = "downloads"
-                    os.makedirs(download_dir, exist_ok=True)
-                    file_path = os.path.join(download_dir, safe_filename_base)
-
-                    counter = 1
-                    base, ext = os.path.splitext(safe_filename_base)
-                    while os.path.exists(file_path):
-                        file_path = os.path.join(download_dir, f"{base}({counter}){ext}")
-                        counter += 1
-
-                    transfer = FileTransfer(file_path, peer_ip, direction="receive")
-                    transfer.transfer_id = transfer_id
-                    transfer.total_size = file_size
-                    transfer.expected_hash = expected_hash
-                    transfer.hash_algo = hashlib.sha256() if expected_hash else None
-                    transfer.state = TransferState.IN_PROGRESS
-                    transfer.file_handle = await aiofiles.open(file_path, "wb")
-                    active_transfers[transfer_id] = transfer
-                    await message_queue.put(f"Receiving '{os.path.basename(file_path)}' from {peer_display_name} (ID: {transfer_id[:8]}...)")
-
-
-                elif message_type == "file_chunk":
-                    transfer_id = data["transfer_id"]
-                    transfer = active_transfers.get(transfer_id)
-                    if transfer and transfer.direction == "receive":
-                        async with transfer.condition:
-                            while transfer.state == TransferState.PAUSED and not shutdown_event.is_set():
-                                await transfer.condition.wait()
-                            if shutdown_event.is_set():
-                                if transfer.file_handle: await transfer.file_handle.close()
-                                if transfer_id in active_transfers: del active_transfers[transfer_id]
-                                break
-
-                        if transfer.state != TransferState.IN_PROGRESS:
-                            continue
-
-                        try:
-                            chunk = bytes.fromhex(data["chunk"])
-
-                            await transfer.file_handle.write(chunk)
-                            transfer.transferred_size += len(chunk)
-                            if transfer.hash_algo:
-                                transfer.hash_algo.update(chunk)
-
-                            if transfer.transferred_size >= transfer.total_size:
-                                await transfer.file_handle.close()
-                                transfer.file_handle = None
-                                final_message = ""
-                                if transfer.expected_hash:
-                                    calculated_hash = transfer.hash_algo.hexdigest()
-                                    if calculated_hash == transfer.expected_hash:
-                                        transfer.state = TransferState.COMPLETED
-                                        final_message = f"'{os.path.basename(transfer.file_path)}' received successfully from {peer_display_name}."
-                                    else:
-                                        transfer.state = TransferState.FAILED
-                                        final_message = f"File integrity check FAILED for '{os.path.basename(transfer.file_path)}' from {peer_display_name}. File deleted."
-                                        logging.error(f"Hash mismatch for {transfer_id}. Expected {transfer.expected_hash}, got {calculated_hash}")
-                                        try: os.remove(transfer.file_path)
-                                        except OSError as rm_err: logging.error(f"Could not remove failed transfer file {transfer.file_path}: {rm_err}")
-                                else:
-                                    transfer.state = TransferState.COMPLETED
-                                    final_message = f"'{os.path.basename(transfer.file_path)}' received from {peer_display_name} (no integrity check)."
-
-                                await message_queue.put(final_message)
-
-                        except Exception as chunk_err:
-                             logging.exception(f"Error processing chunk for transfer {transfer_id}: {chunk_err}")
-                             await message_queue.put(f"Error receiving file chunk from {peer_display_name}. Transfer failed.")
-                             transfer.state = TransferState.FAILED
-                             if transfer.file_handle: await transfer.file_handle.close()
-
-
-                elif message_type == "MESSAGE":
+                if not is_binary:
                     try:
-                        decrypted_message = user_data["private_key"].decrypt( bytes.fromhex(data["message"]), padding.OAEP( mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None ) ).decode()
-                        await message_queue.put(f"{peer_display_name}: {decrypted_message}")
-                    except Exception as decrypt_err:
-                        logging.error(f"Failed to decrypt message from {peer_display_name} ({peer_ip}): {decrypt_err}")
-                        await message_queue.put(f"[Failed to decrypt message from {peer_display_name}]")
+                        data = json.loads(message)
+                        message_type = data.get("type")
+                    except json.JSONDecodeError:
+                        logging.warning(f"Received invalid JSON from {peer_display_name} ({peer_ip}): {message[:100]}")
+                        await message_queue.put(f"[{peer_display_name} sent invalid data]")
+                        continue # Skip processing this message
+                # If binary, message_type is implicitly 'file_chunk' if expected
+                # else: # message is binary (bytes)
 
-                elif message_type == "TRANSFER_PAUSE":
-                    transfer_id = data.get("transfer_id")
-                    transfer = active_transfers.get(transfer_id)
-                    if transfer:
-                        if transfer.peer_ip == peer_ip:
+                peer_display_name = get_peer_display_name(peer_ip) # Refresh name
+
+                # Handle JSON messages
+                if data:
+                    if message_type == "file_transfer_init":
+                        transfer_id = data["transfer_id"]
+                        file_name = data["filename"]
+                        file_size = data["filesize"]
+                        expected_hash = data.get("file_hash")
+                        safe_filename_base = os.path.basename(file_name)
+                        download_dir = "downloads"
+                        os.makedirs(download_dir, exist_ok=True)
+                        file_path = os.path.join(download_dir, safe_filename_base)
+
+                        counter = 1
+                        base, ext = os.path.splitext(safe_filename_base)
+                        while os.path.exists(file_path):
+                            file_path = os.path.join(download_dir, f"{base}({counter}){ext}")
+                            counter += 1
+
+                        transfer = FileTransfer(file_path, peer_ip, direction="receive")
+                        transfer.transfer_id = transfer_id
+                        transfer.total_size = file_size
+                        transfer.expected_hash = expected_hash
+                        transfer.hash_algo = hashlib.sha256() if expected_hash else None
+                        transfer.state = TransferState.IN_PROGRESS
+                        try:
+                            transfer.file_handle = await aiofiles.open(file_path, "wb")
+                            active_transfers[transfer_id] = transfer
+                            current_receiving_transfer_id = transfer_id # Expect binary data now
+                            await message_queue.put(f"Receiving '{os.path.basename(file_path)}' from {peer_display_name} (ID: {transfer_id[:8]}...)")
+                        except OSError as file_open_err:
+                            logging.exception(f"Failed to open file for receiving transfer {transfer_id}: {file_open_err}")
+                            await message_queue.put(f"Error starting file receive from {peer_display_name}: Cannot open file {os.path.basename(file_path)}")
+                            # No transfer object created or stored if file open fails
+
+                    elif message_type == "MESSAGE":
+                        try:
+                            decrypted_message = user_data["private_key"].decrypt( bytes.fromhex(data["message"]), padding.OAEP( mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None ) ).decode()
+                            await message_queue.put(f"{peer_display_name}: {decrypted_message}")
+                        except (ValueError, TypeError) as decrypt_err: # Specific decrypt errors
+                            logging.error(f"Failed to decrypt message from {peer_display_name} ({peer_ip}): {decrypt_err}")
+                            await message_queue.put(f"[Failed to decrypt message from {peer_display_name}]")
+
+                    elif message_type == "TRANSFER_PAUSE":
+                        transfer_id = data.get("transfer_id")
+                        transfer = active_transfers.get(transfer_id)
+                        if transfer and transfer.peer_ip == peer_ip:
                             if transfer.state == TransferState.IN_PROGRESS:
                                 await transfer.pause()
                                 await message_queue.put(f"Peer {peer_display_name} paused transfer {transfer_id[:8]}")
-                            elif transfer.state != TransferState.PAUSED:
-                                logging.warning(f"Received PAUSE for transfer {transfer_id} from {peer_display_name}, but local state is {transfer.state.value}")
-                        else: logging.warning(f"Received PAUSE for transfer {transfer_id} from {peer_display_name}, but transfer belongs to {transfer.peer_ip}")
-                    else: logging.warning(f"Received PAUSE for unknown transfer {transfer_id} from {peer_display_name}")
+                            elif transfer.state != TransferState.PAUSED: logging.warning(f"Received PAUSE for transfer {transfer_id} from {peer_display_name}, but local state is {transfer.state.value}")
+                        elif transfer: logging.warning(f"Received PAUSE for transfer {transfer_id} from {peer_display_name}, but transfer belongs to {transfer.peer_ip}")
+                        else: logging.warning(f"Received PAUSE for unknown transfer {transfer_id} from {peer_display_name}")
 
-                elif message_type == "TRANSFER_RESUME":
-                    transfer_id = data.get("transfer_id")
-                    transfer = active_transfers.get(transfer_id)
-                    if transfer:
-                        if transfer.peer_ip == peer_ip:
+                    elif message_type == "TRANSFER_RESUME":
+                        transfer_id = data.get("transfer_id")
+                        transfer = active_transfers.get(transfer_id)
+                        if transfer and transfer.peer_ip == peer_ip:
                             if transfer.state == TransferState.PAUSED:
                                 await transfer.resume()
                                 await message_queue.put(f"Peer {peer_display_name} resumed transfer {transfer_id[:8]}")
-                            elif transfer.state != TransferState.IN_PROGRESS:
-                                logging.warning(f"Received RESUME for transfer {transfer_id} from {peer_display_name}, but local state is {transfer.state.value}")
-                        else: logging.warning(f"Received RESUME for transfer {transfer_id} from {peer_display_name}, but transfer belongs to {transfer.peer_ip}")
-                    else: logging.warning(f"Received RESUME for unknown transfer {transfer_id} from {peer_display_name}")
+                            elif transfer.state != TransferState.IN_PROGRESS: logging.warning(f"Received RESUME for transfer {transfer_id} from {peer_display_name}, but local state is {transfer.state.value}")
+                        elif transfer: logging.warning(f"Received RESUME for transfer {transfer_id} from {peer_display_name}, but transfer belongs to {transfer.peer_ip}")
+                        else: logging.warning(f"Received RESUME for unknown transfer {transfer_id} from {peer_display_name}")
+                    # Add elif for other JSON message types here if needed
 
-            except json.JSONDecodeError:
-                logging.warning(f"Received invalid JSON from {peer_display_name} ({peer_ip}): {message[:100]}")
-                await message_queue.put(f"[{peer_display_name} sent invalid data]")
-            except Exception as proc_err:
-                logging.exception(f"Error processing message from {peer_display_name} ({peer_ip}): {proc_err}")
-                await message_queue.put(f"[Error processing message from {peer_display_name}]")
+                # Handle Binary messages (assumed file chunk)
+                elif is_binary:
+                    if current_receiving_transfer_id:
+                        transfer = active_transfers.get(current_receiving_transfer_id)
+                        if transfer and transfer.direction == "receive": # Ensure it's the correct transfer
+                            async with transfer.condition:
+                                while transfer.state == TransferState.PAUSED and not shutdown_event.is_set():
+                                    await transfer.condition.wait()
+                                if shutdown_event.is_set(): break # Exit inner loop on shutdown
 
-    except (websockets.exceptions.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK) as closed_err:
-        logging.info(f"Connection with {peer_display_name} ({peer_ip}) closed: {closed_err}")
-    except Exception as e:
-        logging.exception(f"Unexpected error receiving from {peer_display_name} ({peer_ip}): {e}")
+                            if transfer.state != TransferState.IN_PROGRESS: continue # Skip if failed/completed during pause
+
+                            try:
+                                chunk = message # message is already bytes
+
+                                if transfer.file_handle and not transfer.file_handle.closed:
+                                    await transfer.file_handle.write(chunk)
+                                    transfer.transferred_size += len(chunk)
+                                    if transfer.hash_algo:
+                                        transfer.hash_algo.update(chunk)
+
+                                    if transfer.transferred_size >= transfer.total_size:
+                                        await transfer.file_handle.close()
+                                        transfer.file_handle = None
+                                        current_receiving_transfer_id = None # Finished receiving this transfer
+                                        final_message = ""
+                                        if transfer.expected_hash:
+                                            calculated_hash = transfer.hash_algo.hexdigest()
+                                            if calculated_hash == transfer.expected_hash:
+                                                transfer.state = TransferState.COMPLETED
+                                                final_message = f"'{os.path.basename(transfer.file_path)}' received successfully from {peer_display_name}."
+                                            else:
+                                                transfer.state = TransferState.FAILED
+                                                final_message = f"Integrity check FAILED for '{os.path.basename(transfer.file_path)}' from {peer_display_name}. File deleted."
+                                                logging.error(f"Hash mismatch {transfer.transfer_id}. Exp {transfer.expected_hash}, got {calculated_hash}")
+                                                try: os.remove(transfer.file_path)
+                                                except OSError as rm_err: logging.error(f"Could not remove failed file {transfer.file_path}: {rm_err}")
+                                        else:
+                                            transfer.state = TransferState.COMPLETED
+                                            final_message = f"'{os.path.basename(transfer.file_path)}' received from {peer_display_name} (no integrity check)."
+                                        await message_queue.put(final_message)
+                                else:
+                                     logging.warning(f"Received chunk for {transfer.transfer_id} but file handle closed/missing.")
+                                     transfer.state = TransferState.FAILED
+                                     current_receiving_transfer_id = None
+
+                            except IOError as write_err:
+                                 logging.exception(f"IO error writing chunk for {transfer.transfer_id}: {write_err}")
+                                 await message_queue.put(f"IO Error receiving file chunk from {peer_display_name}. Transfer failed.")
+                                 transfer.state = TransferState.FAILED
+                                 current_receiving_transfer_id = None
+                                 if transfer.file_handle and not transfer.file_handle.closed: await transfer.file_handle.close()
+                            except Exception as chunk_err:
+                                 logging.exception(f"Error processing binary chunk for {transfer.transfer_id}: {chunk_err}")
+                                 await message_queue.put(f"Error receiving file chunk from {peer_display_name}. Transfer failed.")
+                                 transfer.state = TransferState.FAILED
+                                 current_receiving_transfer_id = None
+                                 if transfer.file_handle and not transfer.file_handle.closed: await transfer.file_handle.close()
+
+                        else: # Binary data received but doesn't match expected transfer
+                             logging.warning(f"Received unexpected binary data from {peer_display_name} (expected transfer {current_receiving_transfer_id}, found {transfer.transfer_id if transfer else 'None'}). Discarding.")
+                    else: # Binary data received when not expecting a transfer
+                        logging.warning(f"Received unexpected binary data from {peer_display_name} when not in a file transfer. Discarding {len(message)} bytes.")
+
+            except Exception as proc_err: # Catch unexpected errors during message processing
+                logging.exception(f"Unexpected error processing message from {peer_display_name} ({peer_ip}): {proc_err}")
+                await message_queue.put(f"[Unexpected error processing message from {peer_display_name}]")
+
+    except (websockets.exceptions.ConnectionClosed, asyncio.CancelledError) as close_err:
+        logging.info(f"Connection loop for {peer_display_name} ({peer_ip}) terminated: {type(close_err).__name__}")
+    except Exception as e: # Catch unexpected errors in the main receive loop
+        logging.exception(f"Unexpected error in receive loop for {peer_display_name} ({peer_ip}): {e}")
     finally:
-        lost_display_name = get_peer_display_name(peer_ip)
-        logging.info(f"Cleaning up connection state for {lost_display_name} ({peer_ip})")
+        lost_display_name = get_peer_display_name(peer_ip) # Use latest known name
+        logging.info(f"Cleaning up connection state for {lost_display_name} ({peer_ip}) after receive loop exit.")
         lost_original_username = get_peer_original_username(peer_ip)
+
         if peer_ip in connections: del connections[peer_ip]
         if peer_ip in peer_public_keys: del peer_public_keys[peer_ip]
         if peer_ip in peer_device_ids: del peer_device_ids[peer_ip]
         if lost_original_username and lost_original_username in peer_usernames and peer_usernames[lost_original_username] == peer_ip:
              del peer_usernames[lost_original_username]
 
+        await cleanup_transfers_for_peer(peer_ip, lost_display_name)
+
         if not shutdown_event.is_set():
             await message_queue.put(f"Disconnected from {lost_display_name}")
+
+
+async def cleanup_transfers_for_peer(peer_ip, display_name):
+    for transfer_id, transfer in list(active_transfers.items()):
+        if transfer.peer_ip == peer_ip:
+            if transfer.direction == "receive" and transfer.state in (TransferState.IN_PROGRESS, TransferState.PAUSED):
+                logging.warning(f"Peer {display_name} disconnected during receiving transfer {transfer_id}. Marking as failed.")
+                transfer.state = TransferState.FAILED
+                await message_queue.put(f"Receiving transfer {transfer_id[:8]} ('{os.path.basename(transfer.file_path)}') failed: {display_name} disconnected.")
+                if transfer.file_handle and not transfer.file_handle.closed:
+                    try:
+                        await transfer.file_handle.close()
+                        logging.info(f"Closed file handle for failed transfer {transfer_id}.")
+                    except Exception as e:
+                        logging.error(f"Error closing file handle for failed transfer {transfer_id}: {e}")
+            elif transfer.direction == "send" and transfer.state in (TransferState.IN_PROGRESS, TransferState.PAUSED):
+                 logging.warning(f"Peer {display_name} disconnected during sending transfer {transfer_id}. Sender task should handle failure.")
 
 
 async def user_input(discovery):
@@ -671,7 +751,11 @@ async def user_input(discovery):
             message = message.strip()
             if not message: continue
 
-            if message == "/exit": break
+            if message == "/exit":
+                print("Initiating shutdown...")
+                shutdown_event.set()
+                break
+
             if message == "/help":
                  print("\nAvailable commands:")
                  print("  /connect <username>     - Connect to a discovered peer by username")
@@ -697,14 +781,14 @@ async def user_input(discovery):
                     print("  No peers discovered or connected.")
                 else:
                     print(f"- {get_own_display_name()} ({own_ip}, Self)")
-                    for ip in sorted(list(known_ips - {own_ip})): # Sort IPs for consistent order
+                    for ip in sorted(list(known_ips - {own_ip})):
                         disc_info = discovery.peer_list.get(ip)
                         is_connected = ip in connections
                         status = "Connected" if is_connected else "Discovered"
                         display_name = get_peer_display_name(ip)
-                        if not is_connected and '(' not in display_name: # Only discovered, use original name from discovery
+                        if not is_connected and '(' not in display_name:
                              if disc_info: display_name = disc_info[0]
-                             else: status="Stale?" # Should be cleaned up by discovery
+                             else: status="Stale?"
 
                         print(f"- {display_name} ({ip}, {status})")
                 continue
@@ -750,9 +834,14 @@ async def user_input(discovery):
                      with open(config_file_path, "w") as f: json.dump(data_to_save, f, indent=4)
                      print(f"Username changed to '{new_username}' and saved.")
                      await discovery.send_immediate_broadcast()
-                 except Exception as e:
-                     logging.exception(f"Failed to save config during username change: {e}")
-                     print(f"Error saving config. Reverting username change.")
+                 except (IOError, OSError) as e:
+                     logging.error(f"Failed to save updated config file {config_file_path}: {e}")
+                     print(f"Error: Could not save configuration. Reverting username change.")
+                     user_data['original_username'] = old_username
+                     my_display_name = get_own_display_name()
+                 except Exception as e: # Catch unexpected save errors
+                     logging.exception(f"Unexpected error saving config during username change: {e}")
+                     print(f"Unexpected error saving config. Reverting username change.")
                      user_data['original_username'] = old_username
                      my_display_name = get_own_display_name()
                  continue
@@ -818,8 +907,16 @@ async def user_input(discovery):
                 if len(parts) < 2: print("Usage: /send <display_name_or_username> <file_path>"); continue
                 target_identifier, file_path = parts
 
-                if not os.path.exists(file_path): print(f"Error: File not found: {file_path}"); continue
-                if not os.path.isfile(file_path): print(f"Error: Not a file: {file_path}"); continue
+                try:
+                    if not os.path.exists(file_path):
+                        print(f"Error: File not found: {file_path}")
+                        continue
+                    if not os.path.isfile(file_path):
+                        print(f"Error: Not a file: {file_path}")
+                        continue
+                except OSError as e:
+                     print(f"Error accessing file path '{file_path}': {e}")
+                     continue
 
                 result, status = await resolve_peer_target(target_identifier)
 
@@ -874,7 +971,11 @@ async def user_input(discovery):
                          await websocket.send(json.dumps(notification_payload))
                          await local_action_func()
                          print(f"Transfer {transfer_id[:8]} {target_state_msg}.")
-                     except Exception as e: print(f"Error sending {action} notification: {e}")
+                     except websockets.exceptions.ConnectionClosed:
+                          print(f"Error sending {action} notification: Connection closed.")
+                     except Exception as e: # Catch other send errors
+                          logging.error(f"Error sending {action} notification for {transfer_id}: {e}")
+                          print(f"Error sending {action} notification: {e}")
                  continue
 
 
@@ -884,10 +985,13 @@ async def user_input(discovery):
                          await message_queue.put(f"You (to all): {message}")
                 else: print("No peers connected."); continue
 
-        except asyncio.CancelledError: break
-        except Exception as e:
+        except asyncio.CancelledError: break # Exit loop cleanly
+        except FileNotFoundError as e: # Specific catch for file ops
+            print(f"Error: {e}")
+        except Exception as e: # General catch for user input loop
             logging.exception(f"Error in user_input loop: {e}")
-            print(f"\nAn error occurred: {e}"); await asyncio.sleep(1)
+            print(f"\nAn error occurred in the command handler: {type(e).__name__}")
+            await asyncio.sleep(0.1)
 
     logging.info("user_input task finished.")
 
@@ -905,7 +1009,7 @@ async def display_messages():
                  logging.warning(f"Unknown item type in message queue: {type(item)}")
             message_queue.task_done()
         except asyncio.CancelledError: break
-        except Exception as e:
+        except Exception as e: # Broad catch for display task safety
             logging.exception(f"Error displaying message: {e}"); await asyncio.sleep(1)
     logging.info("display_messages task finished.")
 

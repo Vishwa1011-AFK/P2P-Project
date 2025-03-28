@@ -9,38 +9,53 @@ from networking.shared_state import user_data, shutdown_event
 class PeerDiscovery:
     def __init__(self, broadcast_interval=5, cleanup_interval=60):
         self.broadcast_port = 37020
-        self.peer_list = {}  # {ip: (username, last_seen)}
+        self.peer_list = {}
         self.broadcast_interval = broadcast_interval
         self.cleanup_interval = cleanup_interval
         self.running = True
 
     async def send_broadcasts(self):
-        """Send periodic UDP broadcasts to announce presence."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             while self.running and not shutdown_event.is_set():
-                own_ip = await get_own_ip()
-                username = user_data.get("original_username", "unknown")
-                message = json.dumps({"ip": own_ip, "username": username}).encode()
-                for interface in netifaces.interfaces():
-                    try:
-                        if netifaces.AF_INET in netifaces.ifaddresses(interface):
-                            broadcast_addr = netifaces.ifaddresses(interface)[netifaces.AF_INET][0]["broadcast"]
-                            sock.sendto(message, (broadcast_addr, self.broadcast_port))
-                    except Exception as e:
-                        logging.debug(f"Error broadcasting on {interface}: {e}")
+                try:
+                    own_ip = await get_own_ip()
+                    username = user_data.get("original_username", "unknown")
+                    message = json.dumps({"ip": own_ip, "username": username}).encode()
+                    for interface in netifaces.interfaces():
+                        try:
+                            if netifaces.AF_INET in netifaces.ifaddresses(interface):
+                                addrs = netifaces.ifaddresses(interface)[netifaces.AF_INET]
+                                if addrs:
+                                    broadcast_addr = addrs[0].get("broadcast")
+                                    if broadcast_addr:
+                                        sock.sendto(message, (broadcast_addr, self.broadcast_port))
+                        except OSError as e:
+                             logging.debug(f"Network error broadcasting on {interface}: {e}")
+                        except KeyError:
+                             logging.debug(f"Could not find broadcast address for {interface}")
+                        except Exception as e:
+                            logging.debug(f"Unexpected error broadcasting on {interface}: {e}") # Less critical debug log
+                except Exception as outer_e:
+                     logging.error(f"Error preparing broadcast message: {outer_e}")
+
                 await asyncio.sleep(self.broadcast_interval)
         finally:
             sock.close()
         logging.info("send_broadcasts stopped.")
 
     async def receive_broadcasts(self):
-        """Receive UDP broadcasts from peers."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(("", self.broadcast_port))
+        try:
+             sock.bind(("", self.broadcast_port))
+        except OSError as e:
+            logging.critical(f"Could not bind discovery receive socket to port {self.broadcast_port}: {e}")
+            self.running = False # Stop if cannot bind
+            return # Exit the task
+
         sock.setblocking(False)
         loop = asyncio.get_event_loop()
         own_ip = await get_own_ip()
@@ -55,28 +70,47 @@ class PeerDiscovery:
                     username = message["username"]
                     self.peer_list[peer_ip] = (username, asyncio.get_event_loop().time())
                 except json.JSONDecodeError:
-                    logging.warning(f"Invalid broadcast received from {sender_ip}")
+                    logging.warning(f"Invalid JSON broadcast received from {sender_ip}")
+                except KeyError:
+                     logging.warning(f"Malformed broadcast received from {sender_ip} (missing fields)")
+                except UnicodeDecodeError:
+                    logging.warning(f"Non-UTF8 broadcast received from {sender_ip}")
+                except asyncio.CancelledError:
+                     raise # Propagate cancellation
+                except BlockingIOError:
+                     await asyncio.sleep(0.1) # No data available, wait briefly
+                except OSError as e:
+                     logging.error(f"Network error receiving broadcast: {e}")
+                     await asyncio.sleep(1) # Wait longer after network error
                 except Exception as e:
-                    logging.error(f"Error receiving broadcast: {e}")
-                await asyncio.sleep(0.1)
+                    logging.exception(f"Unexpected error receiving broadcast: {e}")
+                    await asyncio.sleep(0.5) # Wait before retrying
+
         finally:
             sock.close()
         logging.info("receive_broadcasts stopped.")
 
     async def cleanup_stale_peers(self):
-        """Remove peers not seen recently."""
         while self.running and not shutdown_event.is_set():
-            current_time = asyncio.get_event_loop().time()
-            for peer_ip in list(self.peer_list.keys()):
-                _, last_seen = self.peer_list[peer_ip]
-                if current_time - last_seen > self.cleanup_interval:
-                    del self.peer_list[peer_ip]
-                    logging.info(f"Removed stale peer: {peer_ip}")
+            try:
+                current_time = asyncio.get_event_loop().time()
+                stale_peers = []
+                for peer_ip, (_, last_seen) in self.peer_list.items():
+                    if current_time - last_seen > self.cleanup_interval:
+                         stale_peers.append(peer_ip)
+
+                for peer_ip in stale_peers:
+                    if peer_ip in self.peer_list: # Check again in case updated
+                        del self.peer_list[peer_ip]
+                        logging.info(f"Removed stale peer: {peer_ip}")
+
+            except Exception as e:
+                 logging.exception(f"Error during stale peer cleanup: {e}")
+
             await asyncio.sleep(self.cleanup_interval)
         logging.info("cleanup_stale_peers stopped.")
 
     async def send_immediate_broadcast(self):
-        """Send an immediate broadcast to announce a username change."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -87,13 +121,21 @@ class PeerDiscovery:
             for interface in netifaces.interfaces():
                 try:
                     if netifaces.AF_INET in netifaces.ifaddresses(interface):
-                        broadcast_addr = netifaces.ifaddresses(interface)[netifaces.AF_INET][0]["broadcast"]
-                        sock.sendto(message, (broadcast_addr, self.broadcast_port))
+                         addrs = netifaces.ifaddresses(interface)[netifaces.AF_INET]
+                         if addrs:
+                             broadcast_addr = addrs[0].get("broadcast")
+                             if broadcast_addr:
+                                 sock.sendto(message, (broadcast_addr, self.broadcast_port))
+                except OSError as e:
+                     logging.debug(f"Network error broadcasting on {interface}: {e}")
+                except KeyError:
+                     logging.debug(f"Could not find broadcast address for {interface}")
                 except Exception as e:
-                    logging.debug(f"Error broadcasting on {interface}: {e}")
+                    logging.debug(f"Unexpected error broadcasting on {interface}: {e}")
+        except Exception as e:
+            logging.error(f"Error sending immediate broadcast: {e}")
         finally:
             sock.close()
 
     def stop(self):
-        """Stop the discovery process."""
         self.running = False
