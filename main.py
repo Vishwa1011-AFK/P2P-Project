@@ -2,6 +2,8 @@ import asyncio
 import logging
 import sys
 import websockets
+import ssl
+import os.path
 from networking.discovery import PeerDiscovery
 from networking.messaging import (
     user_input,
@@ -15,7 +17,6 @@ from networking.messaging import (
 from networking.file_transfer import update_transfer_progress
 from networking.shared_state import peer_usernames, peer_public_keys, shutdown_event
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -23,40 +24,56 @@ logging.basicConfig(
 )
 
 async def handle_peer_connection(websocket, path=None):
-    """Handle incoming WebSocket connections."""
     peer_ip = websocket.remote_address[0]
     logging.info(f"New connection from {peer_ip}")
+    
+    websocket.ping_interval = 30.0  
+    websocket.ping_timeout = 10.0  
+    
     try:
         if await handle_incoming_connection(websocket, peer_ip):
             await receive_peer_messages(websocket, peer_ip)
+    except websockets.exceptions.ConnectionClosedOK:
+        logging.info(f"Connection from {peer_ip} closed normally")
+    except websockets.exceptions.ConnectionClosedError as e:
+        logging.warning(f"Connection from {peer_ip} closed with error: {e}")
     except Exception as e:
         logging.error(f"Error handling connection from {peer_ip}: {e}")
     finally:
-        if peer_ip in connections:
-            del connections[peer_ip]
+        async with connections_lock:
+            if peer_ip in connections:
+                del connections[peer_ip]
 
 async def main():
     """Main application loop."""
     await initialize_user_config()
 
     discovery = PeerDiscovery()
-    # Define all tasks
     broadcast_task = asyncio.create_task(discovery.send_broadcasts())
     discovery_task = asyncio.create_task(discovery.receive_broadcasts())
     cleanup_task = asyncio.create_task(discovery.cleanup_stale_peers())
     progress_task = asyncio.create_task(update_transfer_progress())
     maintain_task = asyncio.create_task(maintain_peer_list(discovery))
-    input_task = asyncio.create_task(user_input(discovery)) # Pass discovery instance
+    input_task = asyncio.create_task(user_input(discovery))
     display_task = asyncio.create_task(display_messages())
 
-    # Start WebSocket server
+    if not os.path.exists("cert.pem") or not os.path.exists("key.pem"):
+        logging.warning("SSL certificates not found! Creating self-signed certificates...")
+        os.system("openssl req -newkey rsa:2048 -nodes -keyout key.pem -x509 -days 365 -out cert.pem -subj '/CN=localhost'")
+        logging.info("Self-signed certificates created")
+
+    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_context.load_cert_chain("cert.pem", "key.pem")
+
     server = await websockets.serve(
         handle_peer_connection,
         "0.0.0.0",
         8765,
         ping_interval=None,
-        max_size=10 * 1024 * 1024,  # Set max_size to 10MB (CHANGE APPLIED HERE)
+        max_size=10 * 1024 * 1024,
+        ssl=ssl_context  
     )
+
     logging.info("WebSocket server started")
 
     tasks = [
@@ -79,22 +96,27 @@ async def main():
     finally:
         logging.info("Initiating shutdown process...")
 
-        # Cancel all tasks
+        async with connections_lock:
+            for peer_ip, websocket in list(connections.items()):
+                try:
+                    if websocket.open:
+                        await websocket.close(code=1001, reason="Application shutting down")
+                        logging.info(f"Sent clean shutdown notification to {peer_ip}")
+                except Exception as e:
+                    logging.error(f"Error during clean closure to {peer_ip}: {e}")
+        
         for task in tasks:
             if not task.done():
                 task.cancel()
                 logging.info(f"Canceled task: {task.get_name()}")
 
-        # Wait for tasks to finish with a timeout
-        await asyncio.wait(tasks, timeout=2.0)
+        await asyncio.wait(tasks, timeout=5.0)
 
-        # Close WebSocket server
         logging.info("Closing WebSocket server...")
         server.close()
         await server.wait_closed()
         logging.info("WebSocket server closed.")
 
-        # Close all peer connections
         for peer_ip, websocket in list(connections.items()):
             try:
                 if websocket.open:
@@ -106,11 +128,9 @@ async def main():
         peer_public_keys.clear()
         peer_usernames.clear()
 
-        # Stop discovery
         logging.info("Stopping discovery...")
         discovery.stop()
 
-        # Clean up file transfers
         from networking.file_transfer import active_transfers
         for transfer_id, transfer in list(active_transfers.items()):
             if transfer.file_handle:

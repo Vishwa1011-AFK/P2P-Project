@@ -15,36 +15,70 @@ class PeerDiscovery:
         self.running = True
 
     async def send_broadcasts(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            while self.running and not shutdown_event.is_set():
-                try:
-                    own_ip = await get_own_ip()
-                    username = user_data.get("original_username", "unknown")
-                    message = json.dumps({"ip": own_ip, "username": username}).encode()
-                    for interface in netifaces.interfaces():
-                        try:
-                            if netifaces.AF_INET in netifaces.ifaddresses(interface):
-                                addrs = netifaces.ifaddresses(interface)[netifaces.AF_INET]
-                                if addrs:
-                                    broadcast_addr = addrs[0].get("broadcast")
-                                    if broadcast_addr:
-                                        sock.sendto(message, (broadcast_addr, self.broadcast_port))
-                        except OSError as e:
-                             logging.debug(f"Network error broadcasting on {interface}: {e}")
-                        except KeyError:
-                             logging.debug(f"Could not find broadcast address for {interface}")
-                        except Exception as e:
-                            logging.debug(f"Unexpected error broadcasting on {interface}: {e}") # Less critical debug log
-                except Exception as outer_e:
-                     logging.error(f"Error preparing broadcast message: {outer_e}")
+        logging.info("Starting broadcast sender task.")
+        while self.running and not shutdown_event.is_set():
+            sock = None
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) 
 
+                own_ip = await get_own_ip()
+                if not own_ip:
+                     logging.warning("Could not determine own IP for broadcast.")
+                     await asyncio.sleep(self.broadcast_interval)
+                     continue
+
+                username = user_data.get("original_username", "unknown")
+                device_id = user_data.get("device_id", "unknown") 
+
+                message = json.dumps({
+                    "ip": own_ip,
+                    "username": username,
+                    "device_id": device_id 
+                }).encode()
+
+                broadcast_sent = False
+
+                for interface in netifaces.interfaces():
+                    try:
+                        if netifaces.AF_INET in netifaces.ifaddresses(interface):
+                            addrs = netifaces.ifaddresses(interface)[netifaces.AF_INET]
+                            if addrs:
+                                broadcast_addr = addrs[0].get("broadcast")
+                                if broadcast_addr:
+
+                                    sock.sendto(message, (broadcast_addr, self.broadcast_port))
+                                    logging.debug(f"Broadcast sent on {interface} to {broadcast_addr}:{self.broadcast_port}")
+                                    broadcast_sent = True
+                    except OSError as e:
+                         logging.debug(f"OS error broadcasting on {interface}: {e}")
+                    except KeyError:
+                         logging.debug(f"Could not find IPv4 or broadcast address details for {interface}")
+                    except Exception as e:
+                        logging.debug(f"Unexpected error broadcasting on interface {interface}: {e}")
+
+                if not broadcast_sent:
+                    logging.warning("Could not successfully broadcast discovery message on any interface.")
+
+            except socket.error as sock_err:
+                 logging.error(f"Socket error during broadcast setup or sending: {sock_err}")
+            except Exception as e:
+                logging.error(f"Error in broadcast task main loop: {e}")
+            finally:
+                if sock:
+                    sock.close() 
+
+            try:
                 await asyncio.sleep(self.broadcast_interval)
-        finally:
-            sock.close()
-        logging.info("send_broadcasts stopped.")
+            except asyncio.CancelledError:
+                logging.info("Broadcast sender task cancelled during sleep.")
+                break 
+
+        logging.info("send_broadcasts task stopped.")
+
+    def stop(self): 
+        self.running = False
 
     async def receive_broadcasts(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -53,9 +87,8 @@ class PeerDiscovery:
              sock.bind(("", self.broadcast_port))
         except OSError as e:
             logging.critical(f"Could not bind discovery receive socket to port {self.broadcast_port}: {e}")
-            self.running = False # Stop if cannot bind
-            return # Exit the task
-
+            self.running = False 
+            return 
         sock.setblocking(False)
         loop = asyncio.get_event_loop()
         own_ip = await get_own_ip()
