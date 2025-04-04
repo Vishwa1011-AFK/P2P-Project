@@ -1,7 +1,6 @@
 import asyncio
 import json
 import os
-import logging
 import websockets
 from appdirs import user_config_dir
 from cryptography.hazmat.primitives import serialization
@@ -75,7 +74,6 @@ async def initialize_user_config():
             user_data["public_key"] = serialization.load_pem_public_key(
                 data["public_key"].encode()
             )
-        logging.info(f"Loaded user config from {keys_file}")
         await message_queue.put(f"Welcome back, {user_data['original_username']}!")
     else:
         private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -83,7 +81,7 @@ async def initialize_user_config():
         username = input("Enter your username: ").strip()
         while not username:
             username = input("Username cannot be empty. Enter your username: ").strip()
-        device_id = os.urandom(16).hex()  # Unique device identifier
+        device_id = os.urandom(16).hex()
 
         user_data["original_username"] = username
         user_data["device_id"] = device_id
@@ -107,80 +105,75 @@ async def initialize_user_config():
                 "private_key": private_key_pem,
                 "public_key": public_key_pem
             }, f, indent=4)
-        logging.info(f"Created new user config at {keys_file}")
         await message_queue.put(f"Welcome, {username}! Your keys have been generated.")
 
 async def connect_to_peer(peer_ip, requesting_username, target_username):
     """Establish a WebSocket connection to a peer."""
     uri = f"ws://{peer_ip}:8765"
     try:
-        async with websockets.connect(uri, ping_interval=None, max_size=10 * 1024 * 1024) as websocket:
-            own_ip = await get_own_ip()
-            await websocket.send(f"INIT {own_ip}")
+        websocket = await websockets.connect(uri, ping_interval=None, max_size=10 * 1024 * 1024)
+        own_ip = await get_own_ip()
+        await websocket.send(f"INIT {own_ip}")
 
-            ack = await websocket.recv()
-            if ack != "INIT_ACK":
-                logging.error(f"Invalid INIT_ACK from {peer_ip}: {ack}")
-                await message_queue.put(f"Failed to connect to {peer_ip}: Invalid handshake")
-                return
+        ack = await websocket.recv()
+        if ack != "INIT_ACK":
+            await message_queue.put(f"Failed to connect to {peer_ip}: Invalid handshake")
+            await websocket.close()
+            return
 
-            public_key_pem = user_data["public_key"].public_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PublicFormat.SubjectPublicKeyInfo
-            ).decode()
-            request_message = json.dumps({
-                "type": "CONNECTION_REQUEST",
-                "requesting_username": requesting_username,
-                "device_id": user_data["device_id"],
-                "target_username": target_username,
-                "key": public_key_pem
-            })
-            await websocket.send(request_message)
+        public_key_pem = user_data["public_key"].public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode()
+        request_message = json.dumps({
+            "type": "CONNECTION_REQUEST",
+            "requesting_username": requesting_username,
+            "device_id": user_data["device_id"],
+            "target_username": target_username,
+            "key": public_key_pem
+        })
+        await websocket.send(request_message)
 
-            response = await websocket.recv()
-            response_data = json.loads(response)
-            if response_data["type"] != "CONNECTION_RESPONSE" or not response_data.get("approved"):
-                reason = response_data.get("reason", "No reason provided")
-                logging.info(f"Connection to {peer_ip} denied: {reason}")
-                await message_queue.put(f"Connection to {target_username} denied: {reason}")
-                return
+        response = await websocket.recv()
+        response_data = json.loads(response)
+        if response_data["type"] != "CONNECTION_RESPONSE" or not response_data.get("approved"):
+            reason = response_data.get("reason", "No reason provided")
+            await message_queue.put(f"Connection to {target_username} denied: {reason}")
+            await websocket.close()
+            return
 
-            await websocket.send(json.dumps({
-                "type": "IDENTITY",
-                "username": user_data["original_username"],
-                "device_id": user_data["device_id"],
-                "key": public_key_pem
-            }))
+        await websocket.send(json.dumps({
+            "type": "IDENTITY",
+            "username": user_data["original_username"],
+            "device_id": user_data["device_id"],
+            "key": public_key_pem
+        }))
 
-            identity_message = await websocket.recv()
-            identity_data = json.loads(identity_message)
-            if identity_data["type"] == "IDENTITY":
-                peer_public_keys[peer_ip] = serialization.load_pem_public_key(identity_data["key"].encode())
-                peer_usernames[identity_data["username"]] = peer_ip
-                peer_device_ids[peer_ip] = identity_data["device_id"]
-                connections[peer_ip] = websocket
-                display_name = get_peer_display_name(peer_ip)
-                await message_queue.put(f"Connected to {display_name}")
-                from networking.messaging.core import receive_peer_messages
-                await receive_peer_messages(websocket, peer_ip)
-            else:
-                logging.error(f"Invalid identity response from {peer_ip}")
-                await message_queue.put(f"Failed to connect to {peer_ip}: Invalid identity response")
+        identity_message = await websocket.recv()
+        identity_data = json.loads(identity_message)
+        if identity_data["type"] == "IDENTITY":
+            peer_public_keys[peer_ip] = serialization.load_pem_public_key(identity_data["key"].encode())
+            peer_usernames[identity_data["username"]] = peer_ip
+            peer_device_ids[peer_ip] = identity_data["device_id"]
+            connections[peer_ip] = websocket
+            display_name = get_peer_display_name(peer_ip)
+            await message_queue.put(f"Connected to {display_name}")
+            from networking.messaging.core import receive_peer_messages
+            await receive_peer_messages(websocket, peer_ip)
+        else:
+            await message_queue.put(f"Failed to connect to {peer_ip}: Invalid identity response")
+            await websocket.close()
     except (websockets.exceptions.WebSocketException, json.JSONDecodeError) as e:
-        logging.error(f"Failed to connect to {peer_ip}: {e}")
         await message_queue.put(f"Failed to connect to {target_username} ({peer_ip}): {e}")
-    except Exception as e:
-        logging.exception(f"Unexpected error connecting to {peer_ip}: {e}")
+    except Exception:
         await message_queue.put(f"Unexpected error connecting to {target_username} ({peer_ip})")
 
 async def disconnect_from_peer(peer_ip):
     """Disconnect from a specific peer."""
     ws = connections.get(peer_ip)
-    if ws and ws.open:
+    if ws and not ws.closed:
         try:
             await ws.close()
-        except Exception as e:
-            logging.error(f"Error closing connection to {peer_ip}: {e}")
         finally:
             if peer_ip in connections:
                 del connections[peer_ip]
@@ -193,5 +186,4 @@ async def disconnect_from_peer(peer_ip):
                 del peer_usernames[username[0]]
             await message_queue.put(f"Disconnected from {get_peer_display_name(peer_ip)}")
     else:
-        logging.warning(f"No active connection to disconnect from {peer_ip}")
         await message_queue.put(f"No active connection to {get_peer_display_name(peer_ip)}")

@@ -1,6 +1,5 @@
 import asyncio
 import json
-import logging
 import os
 import hashlib
 import aiofiles
@@ -19,14 +18,12 @@ from networking.messaging.groups import (
 from networking.messaging.utils import get_peer_display_name, get_own_display_name, get_own_ip
 from networking.file_transfer import FileTransfer, TransferState
 
-# Initialize connection_denials and pending_approvals if not already in shared_state.py
 connection_denials = connection_denials if 'connection_denials' in globals() else {}
 pending_approvals = pending_approvals if 'pending_approvals' in globals() else {}
 
 async def send_message_to_peers(message, peer_ip=None):
     """Send an encrypted message to one or all connected peers."""
     if not isinstance(message, str) or not message:
-        logging.warning("Attempted to send empty or non-string message.")
         return False
 
     targets = []
@@ -34,21 +31,18 @@ async def send_message_to_peers(message, peer_ip=None):
         ws = connections.get(peer_ip)
         key = peer_public_keys.get(peer_ip)
         disp_name = get_peer_display_name(peer_ip)
-        if ws and ws.open and key:
+        if ws and not ws.closed and key:  # Changed from ws.open to not ws.closed
             targets.append((peer_ip, ws, key, disp_name))
         else:
-            logging.error(f"send_message_to_peers called with invalid peer_ip/state: {peer_ip}")
             await message_queue.put(f"Error: Cannot send message, connection state invalid for {disp_name}.")
             return False
     else:
         for ip, ws in list(connections.items()):
-            if ws.open:
+            if not ws.closed:  # Changed from ws.open to not ws.closed
                 key = peer_public_keys.get(ip)
                 disp_name = get_peer_display_name(ip)
                 if key:
                     targets.append((ip, ws, key, disp_name))
-                else:
-                    logging.warning(f"Missing public key for {disp_name} ({ip}). Cannot encrypt message.")
 
     if not targets:
         if not peer_ip:
@@ -66,7 +60,6 @@ async def send_message_to_peers(message, peer_ip=None):
             await websocket.send(payload)
             sent_to_at_least_one = True
         except Exception as e:
-            logging.error(f"Failed to send message to {display_name} ({target_ip}): {e}")
             await message_queue.put(f"Error sending message to {display_name}: {e}")
 
     return sent_to_at_least_one
@@ -89,7 +82,6 @@ async def receive_peer_messages(websocket, peer_ip):
                     data = json.loads(message)
                     message_type = data.get("type")
                 except json.JSONDecodeError:
-                    logging.warning(f"Invalid JSON from {peer_display_name}: {message[:100]}")
                     continue
 
             if data:
@@ -100,8 +92,7 @@ async def receive_peer_messages(websocket, peer_ip):
                             padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
                         ).decode()
                         await message_queue.put(f"{peer_display_name}: {decrypted_message}")
-                    except Exception as e:
-                        logging.error(f"Decrypt error from {peer_display_name}: {e}")
+                    except Exception:
                         await message_queue.put(f"[Failed to decrypt message from {peer_display_name}]")
 
                 elif message_type == "file_transfer_init":
@@ -130,7 +121,6 @@ async def receive_peer_messages(websocket, peer_ip):
                         current_receiving_transfer_id = transfer_id
                         await message_queue.put(f"Receiving '{os.path.basename(file_path)}' from {peer_display_name} (ID: {transfer_id[:8]}...)")
                     except OSError as e:
-                        logging.error(f"Failed to open file for transfer {transfer_id}: {e}")
                         await message_queue.put(f"Error receiving file from {peer_display_name}: Cannot open file")
 
                 elif message_type == "TRANSFER_PAUSE":
@@ -229,9 +219,7 @@ async def receive_peer_messages(websocket, peer_ip):
                                 await message_queue.put(f"'{os.path.basename(transfer.file_path)}' received from {peer_display_name} (no integrity check).")
 
     except websockets.exceptions.ConnectionClosed:
-        logging.info(f"Connection closed for {peer_display_name} ({peer_ip})")
-    except Exception as e:
-        logging.exception(f"Unexpected error in receive loop for {peer_display_name} ({peer_ip}): {e}")
+        await message_queue.put(f"Disconnected from {peer_display_name}")
     finally:
         if peer_ip in connections:
             del connections[peer_ip]
@@ -242,8 +230,6 @@ async def receive_peer_messages(websocket, peer_ip):
         username = [u for u, ip in peer_usernames.items() if ip == peer_ip]
         if username and peer_usernames[username[0]] == peer_ip:
             del peer_usernames[username[0]]
-        if not shutdown_event.is_set():
-            await message_queue.put(f"Disconnected from {peer_display_name}")
 
 async def handle_incoming_connection(websocket, peer_ip):
     """Handle a new incoming WebSocket connection from a peer."""
@@ -256,7 +242,6 @@ async def handle_incoming_connection(websocket, peer_ip):
         if message.startswith("INIT "):
             _, sender_ip = message.split(" ", 1)
             if peer_ip in connections:
-                logging.warning(f"Duplicate connection attempt from {peer_ip}. Closing new one.")
                 await websocket.close(code=1008, reason="Already connected")
                 return False
 
@@ -273,14 +258,12 @@ async def handle_incoming_connection(websocket, peer_ip):
                 requesting_display_name = f"{requesting_username}({requesting_device_id[:8]})"
 
                 if target_username != user_data["original_username"]:
-                    logging.warning(f"Connection request from {requesting_display_name} for wrong target '{target_username}'. Denying.")
                     await websocket.send(json.dumps({"type": "CONNECTION_RESPONSE", "approved": False, "reason": "Incorrect target username"}))
                     await websocket.close()
                     return False
 
                 denial_count = connection_denials.get(target_username, {}).get(requesting_username, 0)
                 if denial_count >= 3:
-                    logging.warning(f"Connection request from blocked user {requesting_display_name}. Denying.")
                     await websocket.send(json.dumps({"type": "CONNECTION_RESPONSE", "approved": False, "reason": "Connection blocked"}))
                     await websocket.close()
                     return False
@@ -297,7 +280,6 @@ async def handle_incoming_connection(websocket, peer_ip):
                 try:
                     approved = await asyncio.wait_for(approval_future, timeout=30.0)
                 except asyncio.TimeoutError:
-                    logging.info(f"Approval for {requesting_display_name} ({peer_ip}) timed out.")
                     await message_queue.put(f"\nApproval request for {requesting_display_name} timed out.")
                 finally:
                     if peer_ip in pending_approvals:
@@ -336,35 +318,27 @@ async def handle_incoming_connection(websocket, peer_ip):
                     peer_usernames[requesting_username] = peer_ip
                     peer_device_ids[peer_ip] = requesting_device_id
                     connections[peer_ip] = websocket
-
                     display_name = get_peer_display_name(peer_ip)
-                    logging.info(f"{get_own_display_name()} accepted connection from {display_name} ({peer_ip})")
                     await message_queue.put(f"Accepted connection from {display_name}")
                     return True
                 else:
-                    logging.error(f"Invalid identity message from {peer_ip} after approval. Closing.")
-                    await websocket.close()
+                    await websocket.close(code=1002, reason="Unexpected message type")
                     return False
             else:
-                logging.warning(f"Unexpected message type from {peer_ip}: {request_data.get('type')}. Closing.")
                 await websocket.close(code=1002, reason="Unexpected message type")
                 return False
         else:
-            logging.warning(f"Invalid initial message from {peer_ip}: '{message[:30]}...'. Closing.")
             await websocket.close(code=1002, reason="Invalid initial message")
             return False
     except json.JSONDecodeError:
-        logging.error(f"Invalid JSON received from {peer_ip}. Closing connection.")
         if websocket.open:
             await websocket.close(code=1007, reason="Invalid JSON")
         return False
     except websockets.exceptions.ConnectionClosed:
-        logging.info(f"Connection closed by {peer_ip} during handshake.")
         if peer_ip in pending_approvals:
             del pending_approvals[peer_ip]
         return False
     except Exception as e:
-        logging.exception(f"Unexpected error in connection handshake with {peer_ip}: {e}")
         if websocket.open:
             await websocket.close(code=1011, reason="Internal server error")
         if peer_ip in pending_approvals:
@@ -380,9 +354,8 @@ async def maintain_peer_list(discovery_instance):
                     break
                 try:
                     await asyncio.wait_for(ws.ping(), timeout=10.0)
-                except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed) as e:
+                except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
                     lost_display_name = get_peer_display_name(peer_ip)
-                    logging.warning(f"Connection lost with {lost_display_name} ({peer_ip}): {type(e).__name__}.")
                     if peer_ip in connections:
                         del connections[peer_ip]
                     if peer_ip in peer_public_keys:
@@ -393,9 +366,8 @@ async def maintain_peer_list(discovery_instance):
                     if username and peer_usernames[username[0]] == peer_ip:
                         del peer_usernames[username[0]]
                     await message_queue.put(f"Disconnected from {lost_display_name} (connection lost)")
-                    if ws.open:
+                    if not ws.closed:
                         await ws.close()
             await asyncio.sleep(15)
-        except Exception as e:
-            logging.exception(f"Error in maintain_peer_list loop: {e}")
+        except Exception:
             await asyncio.sleep(15)

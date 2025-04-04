@@ -1,6 +1,5 @@
 import asyncio
 import json
-import logging
 import os
 from aioconsole import ainput
 from networking.shared_state import (
@@ -59,8 +58,8 @@ async def user_input(discovery):
                 print("  /request_join <group>       - Request to join a group")
                 print("  /approve_join <group> <user>- Approve a join request (admin only)")
                 print("  /deny_join <group> <user>   - Deny a join request (admin only)")
-                print("  /approve <peer_ip>          - Approve a connection request")
-                print("  /deny <peer_ip>             - Deny a connection request")
+                print("  /approve <username>         - Approve a connection request")
+                print("  /deny <username>            - Deny a connection request")
                 print("  <message>                   - Send a message to all connected peers")
                 continue
 
@@ -155,7 +154,7 @@ async def user_input(discovery):
                 if status == "found":
                     peer_ip = result
                     ws = connections.get(peer_ip)
-                    if ws and ws.open:
+                    if ws and not ws.closed:
                         resolved_display_name = get_peer_display_name(peer_ip)
                         print(f"Starting send '{os.path.basename(file_path)}' to {resolved_display_name}...")
                         asyncio.create_task(send_file(file_path, {peer_ip: ws}))
@@ -188,7 +187,7 @@ async def user_input(discovery):
                 peer_ip = matched_transfer.peer_ip
                 transfer_id = matched_transfer.transfer_id
                 ws = connections.get(peer_ip)
-                if not ws or not ws.open:
+                if not ws or ws.closed:
                     print(f"Cannot pause transfer {transfer_id[:8]}: Peer offline.")
                     continue
                 if matched_transfer.state == TransferState.IN_PROGRESS:
@@ -220,7 +219,7 @@ async def user_input(discovery):
                 peer_ip = matched_transfer.peer_ip
                 transfer_id = matched_transfer.transfer_id
                 ws = connections.get(peer_ip)
-                if not ws or not ws.open:
+                if not ws or ws.closed:
                     print(f"Cannot resume transfer {transfer_id[:8]}: Peer offline.")
                     continue
                 if matched_transfer.state == TransferState.PAUSED:
@@ -395,10 +394,11 @@ async def user_input(discovery):
 
             # Approve or deny a connection request (manual approval)
             if message.startswith(("/approve ", "/deny ")):
-                action, peer_ip = message.split(" ", 1)
-                peer_ip = peer_ip.strip()
-                if peer_ip not in pending_approvals:
-                    print(f"No pending connection request from {peer_ip}")
+                action, username = message.split(" ", 1)
+                username = username.strip()
+                peer_ip = peer_usernames.get(username)
+                if not peer_ip or peer_ip not in pending_approvals:
+                    print(f"No pending connection request from '{username}'")
                     continue
                 approval_future = pending_approvals[peer_ip]
                 if action == "/approve":
@@ -416,7 +416,7 @@ async def user_input(discovery):
                 print("No peers connected to send message to.")
 
         except Exception as e:
-            logging.exception(f"Error in user_input: {e}")
+            print(f"Error in user_input: {e}")
             await asyncio.sleep(0.1)
 
 async def display_messages():
@@ -429,8 +429,8 @@ async def display_messages():
             elif isinstance(item, dict) and item.get("type") == "approval_request":
                 peer_ip = item["peer_ip"]
                 requesting_username = item["requesting_username"]
-                print(f"\nConnection request from {requesting_username} ({peer_ip}). Approve? (/approve {peer_ip} or /deny {peer_ip})")
+                print(f"\nConnection request from {requesting_username}. Approve? (/approve {requesting_username.split('(')[0]} or /deny {requesting_username.split('(')[0]})")
             message_queue.task_done()
         except Exception as e:
-            logging.exception(f"Error displaying message: {e}")
+            print(f"Error displaying message: {e}")
             await asyncio.sleep(1)
