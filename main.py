@@ -15,7 +15,12 @@ from networking.messaging import (
     initialize_user_config,
 )
 from networking.file_transfer import update_transfer_progress
-from networking.shared_state import peer_usernames, peer_public_keys, shutdown_event
+from networking.shared_state import (
+    active_transfers, message_queue, connections, user_data, peer_public_keys,
+    peer_usernames, peer_device_ids, shutdown_event, connections_lock
+)
+from networking.messaging import get_config_directory 
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,14 +61,19 @@ async def main():
     maintain_task = asyncio.create_task(maintain_peer_list(discovery))
     input_task = asyncio.create_task(user_input(discovery))
     display_task = asyncio.create_task(display_messages())
+    
+    config_dir = get_config_directory()
+    cert_path = os.path.join(config_dir, "cert.pem")
+    key_path = os.path.join(config_dir, "key.pem")
 
-    if not os.path.exists("cert.pem") or not os.path.exists("key.pem"):
-        logging.warning("SSL certificates not found! Creating self-signed certificates...")
-        os.system("openssl req -newkey rsa:2048 -nodes -keyout key.pem -x509 -days 365 -out cert.pem -subj '/CN=localhost'")
-        logging.info("Self-signed certificates created")
+    if not os.path.exists(cert_path) or not os.path.exists(key_path):
+    logging.warning("SSL certificates not found! Creating self-signed certificates...")
+    os.makedirs(config_dir, exist_ok=True)
+    os.system(f"openssl req -newkey rsa:2048 -nodes -keyout {key_path} -x509 -days 365 -out {cert_path} -subj '/CN=localhost'")
+    logging.info(f"Self-signed certificates created in {config_dir}")
 
     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ssl_context.load_cert_chain("cert.pem", "key.pem")
+    ssl_context.load_cert_chain(cert_path, key_path)
 
     server = await websockets.serve(
         handle_peer_connection,
