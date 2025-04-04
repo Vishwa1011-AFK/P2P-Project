@@ -20,7 +20,7 @@ from networking.file_transfer import send_file, TransferState
 
 async def user_input(discovery):
     """Handle user input commands asynchronously."""
-    await asyncio.sleep(1)  # Brief delay to ensure initialization completes
+    await asyncio.sleep(1)
     my_display_name = get_own_display_name()
 
     while not shutdown_event.is_set():
@@ -29,13 +29,11 @@ async def user_input(discovery):
             if not message:
                 continue
 
-            # Exit command
             if message == "/exit":
                 print("Initiating shutdown...")
                 shutdown_event.set()
                 break
 
-            # Help command
             if message == "/help":
                 print("\nAvailable commands:")
                 print("  /exit                       - Shut down the application")
@@ -63,18 +61,18 @@ async def user_input(discovery):
                 print("  <message>                   - Send a message to all connected peers")
                 continue
 
-            # List all active peers in the network
             if message == "/list":
+                own_ip = await get_own_ip()  # Get local IP for comparison
                 if not discovery.peer_list:
                     print("No active peers discovered in the network.")
                 else:
                     print("Active peers in the network:")
                     for peer_ip, (username, last_seen) in discovery.peer_list.items():
+                        ip_display = f"{peer_ip} (self)" if peer_ip == own_ip else peer_ip
                         status = "Connected" if peer_ip in connections else "Disconnected"
-                        print(f"- {username} ({peer_ip}) - {status}")
+                        print(f"- {username} ({ip_display}) - {status}")
                 continue
 
-            # List connected peers
             if message == "/peers":
                 if not connections:
                     print("No peers connected.")
@@ -85,7 +83,6 @@ async def user_input(discovery):
                         print(f"- {display_name} ({peer_ip})")
                 continue
 
-            # Connect to a peer
             if message.startswith("/connect "):
                 target_username = message[len("/connect "):].strip()
                 if not target_username:
@@ -98,11 +95,14 @@ async def user_input(discovery):
                 if peer_ip in connections:
                     print(f"Already connected to {get_peer_display_name(peer_ip)}.")
                     continue
+                own_ip = await get_own_ip()
+                if peer_ip == own_ip:
+                    print("Cannot connect to yourself.")
+                    continue
                 asyncio.create_task(connect_to_peer(peer_ip, user_data["original_username"], target_username))
                 print(f"Attempting to connect to {target_username}...")
                 continue
 
-            # Disconnect from a peer
             if message.startswith("/disconnect "):
                 target_identifier = message[len("/disconnect "):].strip()
                 if not target_identifier:
@@ -119,7 +119,6 @@ async def user_input(discovery):
                     print(f"Ambiguous target '{target_identifier}'. Matches: {', '.join(result)}")
                 continue
 
-            # Send a private message
             if message.startswith("/msg "):
                 parts = message[len("/msg "):].split(" ", 1)
                 if len(parts) < 2:
@@ -140,7 +139,6 @@ async def user_input(discovery):
                     print(f"Ambiguous target '{target_identifier}'. Matches: {', '.join(result)}")
                 continue
 
-            # Send a file
             if message.startswith("/send "):
                 parts = message[len("/send "):].split(" ", 1)
                 if len(parts) < 2:
@@ -166,7 +164,6 @@ async def user_input(discovery):
                     print(f"Error: Ambiguous target '{target_identifier}'. Matches: {', '.join(result)}")
                 continue
 
-            # Pause a file transfer
             if message.startswith("/pause "):
                 transfer_id_prefix = message[len("/pause "):].strip()
                 if not transfer_id_prefix:
@@ -198,7 +195,6 @@ async def user_input(discovery):
                     print(f"Cannot pause (state: {matched_transfer.state.value})")
                 continue
 
-            # Resume a file transfer
             if message.startswith("/resume "):
                 transfer_id_prefix = message[len("/resume "):].strip()
                 if not transfer_id_prefix:
@@ -230,7 +226,6 @@ async def user_input(discovery):
                     print(f"Cannot resume (state: {matched_transfer.state.value})")
                 continue
 
-            # List active transfers
             if message == "/transfers":
                 if not active_transfers:
                     print("\nNo active transfers.")
@@ -247,7 +242,6 @@ async def user_input(discovery):
                     print(f"    Progress: {progress:.1f}% ({transferred_mb:.2f}/{total_size_mb:.2f} MB)")
                 continue
 
-            # List all groups
             if message == "/groups":
                 if not groups:
                     print("You are not in any groups.")
@@ -257,7 +251,6 @@ async def user_input(discovery):
                         print(f"- {groupname} (Admin: {get_peer_display_name(info['admin'])})")
                 continue
 
-            # List users in a group
             if message.startswith("/users "):
                 groupname = message[len("/users "):].strip()
                 if groupname not in groups:
@@ -268,7 +261,6 @@ async def user_input(discovery):
                         print(f"- {get_peer_display_name(member_ip)}")
                 continue
 
-            # Create a group
             if message.startswith("/create_group "):
                 groupname = message[len("/create_group "):].strip()
                 if not groupname:
@@ -283,7 +275,6 @@ async def user_input(discovery):
                     print(f"Group '{groupname}' created.")
                 continue
 
-            # Invite a user to a group
             if message.startswith("/invite "):
                 parts = message[len("/invite "):].split(" ", 1)
                 if len(parts) < 2:
@@ -305,7 +296,6 @@ async def user_input(discovery):
                 print(f"Invited {username} to '{groupname}'")
                 continue
 
-            # Accept a group invite
             if message.startswith("/accept_invite "):
                 groupname = message[len("/accept_invite "):].strip()
                 invite = next((inv for inv in pending_invites if inv["groupname"] == groupname), None)
@@ -319,7 +309,6 @@ async def user_input(discovery):
                 print(f"Accepted invite to '{groupname}'")
                 continue
 
-            # Decline a group invite
             if message.startswith("/decline_invite "):
                 groupname = message[len("/decline_invite "):].strip()
                 invite = next((inv for inv in pending_invites if inv["groupname"] == groupname), None)
@@ -331,7 +320,6 @@ async def user_input(discovery):
                 print(f"Declined invite to '{groupname}'")
                 continue
 
-            # Request to join a group
             if message.startswith("/request_join "):
                 groupname = message[len("/request_join "):].strip()
                 if not groupname:
@@ -348,7 +336,6 @@ async def user_input(discovery):
                 print(f"Sent join request for '{groupname}' to admin.")
                 continue
 
-            # Approve a join request
             if message.startswith("/approve_join "):
                 parts = message[len("/approve_join "):].split(" ", 1)
                 if len(parts) < 2:
@@ -371,7 +358,6 @@ async def user_input(discovery):
                 print(f"Approved join request from '{username}' for '{groupname}'")
                 continue
 
-            # Deny a join request
             if message.startswith("/deny_join "):
                 parts = message[len("/deny_join "):].split(" ", 1)
                 if len(parts) < 2:
@@ -392,15 +378,16 @@ async def user_input(discovery):
                 print(f"Denied join request from '{username}' for '{groupname}'")
                 continue
 
-            # Approve or deny a connection request (manual approval)
             if message.startswith(("/approve ", "/deny ")):
                 action, username = message.split(" ", 1)
                 username = username.strip()
-                peer_ip = peer_usernames.get(username)
-                if not peer_ip or peer_ip not in pending_approvals:
+                matching_approval = next(
+                    ((ip, uname), future) for (ip, uname), future in pending_approvals.items() if uname == username
+                )
+                if not matching_approval:
                     print(f"No pending connection request from '{username}'")
                     continue
-                approval_future = pending_approvals[peer_ip]
+                (peer_ip, _), approval_future = matching_approval
                 if action == "/approve":
                     approval_future.set_result(True)
                     print(f"Approved connection from {get_peer_display_name(peer_ip)}")
@@ -409,7 +396,6 @@ async def user_input(discovery):
                     print(f"Denied connection from {get_peer_display_name(peer_ip)}")
                 continue
 
-            # Default: Send message to all peers
             if connections and await send_message_to_peers(message):
                 await message_queue.put(f"You (to all): {message}")
             else:
@@ -429,7 +415,8 @@ async def display_messages():
             elif isinstance(item, dict) and item.get("type") == "approval_request":
                 peer_ip = item["peer_ip"]
                 requesting_username = item["requesting_username"]
-                print(f"\nConnection request from {requesting_username}. Approve? (/approve {requesting_username.split('(')[0]} or /deny {requesting_username.split('(')[0]})")
+                base_username = requesting_username.split("(")[0]
+                print(f"\nConnection request from {requesting_username}. Approve? (/approve {base_username} or /deny {base_username})")
             message_queue.task_done()
         except Exception as e:
             print(f"Error displaying message: {e}")

@@ -231,9 +231,17 @@ async def receive_peer_messages(websocket, peer_ip):
         if username and peer_usernames[username[0]] == peer_ip:
             del peer_usernames[username[0]]
 
-async def handle_incoming_connection(websocket, peer_ip):
+aasync def handle_incoming_connection(websocket, peer_ip):
     """Handle a new incoming WebSocket connection from a peer."""
     try:
+        # Get own IP to check against peer_ip
+        own_ip = await get_own_ip()
+        if peer_ip == own_ip:
+            await websocket.send(json.dumps({"type": "CONNECTION_RESPONSE", "approved": False, "reason": "Cannot connect to self"}))
+            await websocket.close(code=1008, reason="Self-connection rejected")
+            await message_queue.put("Rejected connection attempt from self.")
+            return False
+
         message = await websocket.recv()
         if shutdown_event.is_set():
             await websocket.close(code=1001, reason="Server shutting down")
@@ -269,7 +277,7 @@ async def handle_incoming_connection(websocket, peer_ip):
                     return False
 
                 approval_future = asyncio.Future()
-                pending_approvals[peer_ip] = approval_future
+                pending_approvals[(peer_ip, requesting_username)] = approval_future
                 await message_queue.put({
                     "type": "approval_request",
                     "peer_ip": peer_ip,
@@ -282,8 +290,8 @@ async def handle_incoming_connection(websocket, peer_ip):
                 except asyncio.TimeoutError:
                     await message_queue.put(f"\nApproval request for {requesting_display_name} timed out.")
                 finally:
-                    if peer_ip in pending_approvals:
-                        del pending_approvals[peer_ip]
+                    if (peer_ip, requesting_username) in pending_approvals:
+                        del pending_approvals[(peer_ip, requesting_username)]
 
                 if not approved:
                     if target_username not in connection_denials:
@@ -335,14 +343,14 @@ async def handle_incoming_connection(websocket, peer_ip):
             await websocket.close(code=1007, reason="Invalid JSON")
         return False
     except websockets.exceptions.ConnectionClosed:
-        if peer_ip in pending_approvals:
-            del pending_approvals[peer_ip]
+        if (peer_ip, requesting_username) in pending_approvals:
+            del pending_approvals[(peer_ip, requesting_username)]
         return False
     except Exception as e:
         if websocket.open:
             await websocket.close(code=1011, reason="Internal server error")
-        if peer_ip in pending_approvals:
-            del pending_approvals[peer_ip]
+        if (peer_ip, requesting_username) in pending_approvals:
+            del pending_approvals[(peer_ip, requesting_username)]
         return False
 
 async def maintain_peer_list(discovery_instance):
