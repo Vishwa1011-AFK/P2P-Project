@@ -36,6 +36,45 @@ async def user_input(discovery):
                 shutdown_event.set()
                 break
 
+            # Help command
+            if message == "/help":
+                print("\nAvailable commands:")
+                print("  /exit                       - Shut down the application")
+                print("  /help                       - Show this help message")
+                print("  /list                       - List all active peers in the network")
+                print("  /peers                      - List currently connected peers")
+                print("  /connect <username>         - Connect to a peer by username")
+                print("  /disconnect <name>          - Disconnect from a peer by display name or username")
+                print("  /msg <name> <message>       - Send a private message to a peer")
+                print("  /send <name> <file_path>    - Send a file to a peer")
+                print("  /pause <transfer_id>        - Pause a file transfer")
+                print("  /resume <transfer_id>       - Resume a paused file transfer")
+                print("  /transfers                  - List all active file transfers")
+                print("  /groups                     - List all groups you are in")
+                print("  /users <groupname>          - List users in a specific group")
+                print("  /create_group <groupname>   - Create a new group")
+                print("  /invite <group> <username>  - Invite a user to a group (admin only)")
+                print("  /accept_invite <group>      - Accept a group invitation")
+                print("  /decline_invite <group>     - Decline a group invitation")
+                print("  /request_join <group>       - Request to join a group")
+                print("  /approve_join <group> <user>- Approve a join request (admin only)")
+                print("  /deny_join <group> <user>   - Deny a join request (admin only)")
+                print("  /approve <peer_ip>          - Approve a connection request")
+                print("  /deny <peer_ip>             - Deny a connection request")
+                print("  <message>                   - Send a message to all connected peers")
+                continue
+
+            # List all active peers in the network
+            if message == "/list":
+                if not discovery.peer_list:
+                    print("No active peers discovered in the network.")
+                else:
+                    print("Active peers in the network:")
+                    for peer_ip, (username, last_seen) in discovery.peer_list.items():
+                        status = "Connected" if peer_ip in connections else "Disconnected"
+                        print(f"- {username} ({peer_ip}) - {status}")
+                continue
+
             # List connected peers
             if message == "/peers":
                 if not connections:
