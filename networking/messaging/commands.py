@@ -129,7 +129,7 @@ async def user_input(discovery):
                 if status == "found":
                     peer_ip = result
                     resolved_display_name = get_peer_display_name(peer_ip)
-                    if await send_message_to_peers(msg_content, peer_ip):
+                    if await send_message_to_peers(msg_content, peer_ip):  # Pass peer_ip directly
                         await message_queue.put(f"You (to {resolved_display_name}): {msg_content}")
                     else:
                         print(f"Failed to send message to {resolved_display_name}.")

@@ -2,6 +2,7 @@ import asyncio
 import logging
 import sys
 import websockets
+from websockets.connection import State  # Added for state checking
 from networking.discovery import PeerDiscovery
 from networking.messaging.core import receive_peer_messages, handle_incoming_connection, connections
 from networking.messaging.commands import user_input, display_messages, initialize_user_config
@@ -35,21 +36,33 @@ async def main():
         asyncio.create_task(user_input(discovery)),
         asyncio.create_task(display_messages()),
     ]
-    server = await websockets.serve(handle_peer_connection, "0.0.0.0", 8765, ping_interval=None, max_size=10 * 1024 * 1024)
+    server = await websockets.serve(
+        handle_peer_connection, "0.0.0.0", 8765, ping_interval=None, max_size=10 * 1024 * 1024
+    )
     logging.info("WebSocket server started")
     try:
         await asyncio.gather(*tasks)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         shutdown_event.set()
-    finally:
+        logging.info("Shutdown initiated...")
+        # Cancel all tasks
         for task in tasks:
             if not task.done():
                 task.cancel()
+        # Close server
         server.close()
         await server.wait_closed()
-        for ws in list(connections.values()):
-            if ws.open:
-                await ws.close()
+        # Close all WebSocket connections
+        close_tasks = [
+            ws.close(code=1001, reason="Server shutting down")
+            for ws in connections.values()
+            if ws.state == State.OPEN
+        ]
+        if close_tasks:
+            await asyncio.gather(*close_tasks, return_exceptions=True)
+        # Wait for tasks to finish
+        await asyncio.gather(*tasks, return_exceptions=True)
+        # Clear shared state
         connections.clear()
         peer_public_keys.clear()
         peer_usernames.clear()

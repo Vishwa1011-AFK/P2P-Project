@@ -6,10 +6,10 @@ import aiofiles
 import hashlib
 import logging
 import json
-import websockets
 from enum import Enum
-from networking.shared_state import active_transfers, shutdown_event, message_queue
-from networking.messaging.utils import get_peer_display_name  # Import for display name
+from networking.shared_state import active_transfers, shutdown_event, message_queue, connections
+from networking.messaging.utils import get_peer_display_name
+from websockets.connection import State
 
 class TransferState(Enum):
     IN_PROGRESS = "in_progress"
@@ -60,7 +60,8 @@ async def send_file(file_path, peers):
     file_size = os.path.getsize(file_path)
     file_name = os.path.basename(file_path)
     file_hash = await compute_hash(file_path)
-    transfer = FileTransfer(file_path, list(peers.keys())[0], direction="send")
+    peer_ip = list(peers.keys())[0]  # Assuming single peer for now
+    transfer = FileTransfer(file_path, peer_ip, direction="send")
     transfer.transfer_id = transfer_id
     transfer.total_size = file_size
     transfer.expected_hash = file_hash
@@ -75,7 +76,7 @@ async def send_file(file_path, peers):
     })
     connected_peers = {}
     for peer_ip, ws in peers.items():
-        if ws.open:
+        if ws.state == State.OPEN:
             await ws.send(init_message)
             connected_peers[peer_ip] = ws
 
@@ -92,6 +93,8 @@ async def send_file(file_path, peers):
             async with transfer.condition:
                 while transfer.state == TransferState.PAUSED and not shutdown_event.is_set():
                     await transfer.condition.wait()
+                if shutdown_event.is_set():
+                    break
                 if transfer.state != TransferState.IN_PROGRESS:
                     break
             chunk = await f.read(chunk_size)
@@ -99,9 +102,16 @@ async def send_file(file_path, peers):
                 transfer.state = TransferState.COMPLETED
                 break
             transfer.transferred_size += len(chunk)
+            transfer.hash_algo.update(chunk)
+            chunk_hex = chunk.hex()
+            message = json.dumps({"type": "file_chunk", "transfer_id": transfer_id, "chunk": chunk_hex})
             for peer_ip, ws in list(peers.items()):
-                if ws.open:
-                    await ws.send(chunk)
+                if ws.state == State.OPEN:
+                    try:
+                        await ws.send(message)
+                    except Exception as e:
+                        logging.error(f"Failed to send chunk to {peer_ip}: {e}")
+                        del peers[peer_ip]
                 else:
                     del peers[peer_ip]
             if not peers:
@@ -111,14 +121,18 @@ async def send_file(file_path, peers):
         await transfer.file_handle.close()
     if transfer.state == TransferState.COMPLETED:
         await message_queue.put(f"Sent '{file_name}' successfully.")
+    elif transfer.state == TransferState.FAILED:
+        await message_queue.put(f"Failed to send '{file_name}' due to peer disconnection.")
+    elif shutdown_event.is_set():
+        await message_queue.put(f"Transfer of '{file_name}' cancelled due to shutdown.")
 
 async def update_transfer_progress():
     """Periodically update and display progress of active file transfers."""
     while not shutdown_event.is_set():
         try:
             if active_transfers:
-                for transfer_id, transfer in active_transfers.items():
-                    if transfer.total_size > 0:  # Avoid division by zero
+                for transfer_id, transfer in list(active_transfers.items()):
+                    if transfer.total_size > 0:
                         progress = (transfer.transferred_size / transfer.total_size) * 100
                         direction = "Sending" if transfer.direction == "send" else "Receiving"
                         peer_display = get_peer_display_name(transfer.peer_ip)
@@ -131,7 +145,9 @@ async def update_transfer_progress():
                         )
                         logging.info(msg)
                         await message_queue.put(msg)
-            await asyncio.sleep(5)  # Update every 5 seconds
+                    if transfer.state in (TransferState.COMPLETED, TransferState.FAILED):
+                        del active_transfers[transfer_id]
+            await asyncio.sleep(5)
         except Exception as e:
             logging.error(f"Error in update_transfer_progress: {e}")
             await asyncio.sleep(5)
