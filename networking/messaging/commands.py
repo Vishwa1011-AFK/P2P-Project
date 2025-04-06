@@ -62,7 +62,7 @@ async def user_input(discovery):
                 continue
 
             if message == "/list":
-                own_ip = await get_own_ip()  # Get local IP for comparison
+                own_ip = await get_own_ip()
                 if not discovery.peer_list:
                     print("No active peers discovered in the network.")
                 else:
@@ -406,7 +406,7 @@ async def user_input(discovery):
             await asyncio.sleep(0.1)
 
 async def display_messages():
-    """Display messages and prompts from the message queue."""
+    """Handle message display from the message queue."""
     while not shutdown_event.is_set():
         try:
             item = await message_queue.get()
