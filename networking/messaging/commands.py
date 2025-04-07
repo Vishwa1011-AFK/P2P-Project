@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 from aioconsole import ainput
+from websockets.connection import State  # Added for state checking
 from networking.shared_state import (
     connections, message_queue, active_transfers, user_data, peer_public_keys,
     peer_usernames, peer_device_ids, shutdown_event, groups, pending_invites, pending_join_requests,
@@ -129,7 +130,7 @@ async def user_input(discovery):
                 if status == "found":
                     peer_ip = result
                     resolved_display_name = get_peer_display_name(peer_ip)
-                    if await send_message_to_peers(msg_content, peer_ip):  # Pass peer_ip directly
+                    if await send_message_to_peers(msg_content, peer_ip):
                         await message_queue.put(f"You (to {resolved_display_name}): {msg_content}")
                     else:
                         print(f"Failed to send message to {resolved_display_name}.")
@@ -152,7 +153,7 @@ async def user_input(discovery):
                 if status == "found":
                     peer_ip = result
                     ws = connections.get(peer_ip)
-                    if ws and not ws.closed:
+                    if ws and ws.state == State.OPEN:  # Updated from .closed
                         resolved_display_name = get_peer_display_name(peer_ip)
                         print(f"Starting send '{os.path.basename(file_path)}' to {resolved_display_name}...")
                         asyncio.create_task(send_file(file_path, {peer_ip: ws}))
@@ -184,7 +185,7 @@ async def user_input(discovery):
                 peer_ip = matched_transfer.peer_ip
                 transfer_id = matched_transfer.transfer_id
                 ws = connections.get(peer_ip)
-                if not ws or ws.closed:
+                if not ws or ws.state != State.OPEN:  # Updated from .closed
                     print(f"Cannot pause transfer {transfer_id[:8]}: Peer offline.")
                     continue
                 if matched_transfer.state == TransferState.IN_PROGRESS:
@@ -215,7 +216,7 @@ async def user_input(discovery):
                 peer_ip = matched_transfer.peer_ip
                 transfer_id = matched_transfer.transfer_id
                 ws = connections.get(peer_ip)
-                if not ws or ws.closed:
+                if not ws or ws.state != State.OPEN:  # Updated from .closed
                     print(f"Cannot resume transfer {transfer_id[:8]}: Peer offline.")
                     continue
                 if matched_transfer.state == TransferState.PAUSED:
@@ -407,7 +408,7 @@ async def user_input(discovery):
 
 async def display_messages():
     """Handle message display from the message queue."""
-    while not shutdown_event.is_set():
+    while not shutdown_event.is_set(): 
         try:
             item = await message_queue.get()
             if isinstance(item, str):

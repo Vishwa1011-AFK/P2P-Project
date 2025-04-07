@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import websockets
+from websockets.connection import State  # Added for state checking
 from appdirs import user_config_dir
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -171,7 +172,7 @@ async def connect_to_peer(peer_ip, requesting_username, target_username):
 async def disconnect_from_peer(peer_ip):
     """Disconnect from a specific peer."""
     ws = connections.get(peer_ip)
-    if ws and not ws.closed:
+    if ws and ws.state == State.OPEN:  # Updated from .closed
         try:
             await ws.close()
         finally:
