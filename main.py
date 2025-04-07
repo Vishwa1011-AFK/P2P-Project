@@ -2,12 +2,11 @@ import asyncio
 import logging
 import sys
 import websockets
-from websockets.connection import State  # Added for state checking
+from websockets.connection import State
 from networking.discovery import PeerDiscovery
 from networking.messaging.core import receive_peer_messages, handle_incoming_connection, connections
 from networking.messaging.commands import user_input, display_messages, initialize_user_config
 from networking.messaging.core import maintain_peer_list
-from networking.file_transfer import update_transfer_progress
 from networking.shared_state import peer_usernames, peer_public_keys, shutdown_event
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", stream=sys.stdout)
@@ -31,7 +30,6 @@ async def main():
         asyncio.create_task(discovery.send_broadcasts()),
         asyncio.create_task(discovery.receive_broadcasts()),
         asyncio.create_task(discovery.cleanup_stale_peers()),
-        asyncio.create_task(update_transfer_progress()),
         asyncio.create_task(maintain_peer_list(discovery)),
         asyncio.create_task(user_input(discovery)),
         asyncio.create_task(display_messages()),
@@ -41,11 +39,11 @@ async def main():
     )
     logging.info("WebSocket server started")
     try:
-        await asyncio.gather(*tasks)
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        shutdown_event.set()
+        # Run until shutdown_event is set
+        await shutdown_event.wait()
+    finally:
         logging.info("Shutdown initiated...")
-        # Cancel all tasks
+        # Cancel all tasks immediately
         for task in tasks:
             if not task.done():
                 task.cancel()
@@ -60,14 +58,19 @@ async def main():
         ]
         if close_tasks:
             await asyncio.gather(*close_tasks, return_exceptions=True)
-        # Wait for tasks to finish
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # Give tasks a short time to finish (2 seconds max)
+        try:
+            await asyncio.wait(tasks, timeout=2)
+        except asyncio.TimeoutError:
+            logging.info("Some tasks did not complete in time, forcing shutdown.")
         # Clear shared state
         connections.clear()
         peer_public_keys.clear()
         peer_usernames.clear()
         discovery.stop()
         logging.info("Application fully shut down.")
+        # Force event loop to stop
+        asyncio.get_event_loop().stop()
 
 if __name__ == "__main__":
     asyncio.run(main())
