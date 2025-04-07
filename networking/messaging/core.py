@@ -6,7 +6,9 @@ import hashlib
 import aiofiles
 import websockets
 from websockets.connection import State
-from cryptography.hazmat.primitives import hashes, padding, serialization
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding  # Correct import for OAEP
+from cryptography.hazmat.primitives import serialization
 from networking.shared_state import (
     active_transfers, message_queue, connections, user_data, peer_public_keys, 
     peer_usernames, shutdown_event, pending_approvals, connection_denials
@@ -255,7 +257,7 @@ async def send_message_to_peers(message, target=None):
             try:
                 encrypted_message = peer_public_keys[peer_ip].encrypt(
                     message.encode(),
-                    padding.OAEP(
+                    padding.OAEP(  # Correctly using asymmetric.padding
                         mgf=padding.MGF1(algorithm=hashes.SHA256()),
                         algorithm=hashes.SHA256(),
                         label=None
@@ -277,7 +279,7 @@ async def send_message_to_peers(message, target=None):
                     peer_username = next((u for u, ip in peer_usernames.items() if ip == peer_ip), "unknown")
                     encrypted_msg = peer_public_keys[peer_ip].encrypt(
                         message.encode(),
-                        padding.OAEP(
+                        padding.OAEP(  # Correctly using asymmetric.padding
                             mgf=padding.MGF1(algorithm=hashes.SHA256()),
                             algorithm=hashes.SHA256(),
                             label=None
