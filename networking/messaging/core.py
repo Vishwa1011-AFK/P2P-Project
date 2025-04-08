@@ -15,7 +15,7 @@ from networking.shared_state import (
 )
 from networking.utils import get_own_ip
 from networking.file_transfer import FileTransfer, TransferState
-from networking.messaging.utils import get_peer_display_name
+from networking.messaging.utils import get_peer_display_name, connect_to_peer  # Added connect_to_peer
 
 peer_list = {}
 
@@ -351,8 +351,7 @@ async def send_message_to_peers(message, target=None):
 async def maintain_peer_list(peer_discovery):
     while not shutdown_event.is_set():
         try:
-            # Use peer_discovery.peer_list instead of discover_peers()
-            peers = peer_discovery.peer_list.keys()  # Get list of peer IPs
+            peers = peer_discovery.peer_list.keys()
             for peer_ip in peers:
                 if peer_ip not in connections and peer_ip not in peer_list:
                     peer_list[peer_ip] = True

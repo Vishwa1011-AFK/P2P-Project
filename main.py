@@ -43,7 +43,7 @@ async def main():
         await shutdown_event.wait()
     finally:
         logging.info("Shutdown initiated...")
-        # Cancel all tasks immediately
+        # Cancel all tasks
         for task in tasks:
             if not task.done():
                 task.cancel()
@@ -58,19 +58,20 @@ async def main():
         ]
         if close_tasks:
             await asyncio.gather(*close_tasks, return_exceptions=True)
-        # Give tasks a short time to finish (2 seconds max)
+        # Wait for tasks to finish with a timeout
         try:
             await asyncio.wait(tasks, timeout=2)
         except asyncio.TimeoutError:
-            logging.info("Some tasks did not complete in time, forcing shutdown.")
-        # Clear shared state
+            logging.info("Some tasks did not complete in time, proceeding with shutdown.")
+        # Clean up resources
         connections.clear()
         peer_public_keys.clear()
         peer_usernames.clear()
         discovery.stop()
+        # Shut down the default executor
+        loop = asyncio.get_event_loop()
+        await loop.shutdown_default_executor()
         logging.info("Application fully shut down.")
-        # Force event loop to stop
-        asyncio.get_event_loop().stop()
 
 if __name__ == "__main__":
     asyncio.run(main())
