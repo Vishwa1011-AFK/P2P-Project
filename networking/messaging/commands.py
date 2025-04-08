@@ -30,7 +30,7 @@ async def user_input(discovery):
                 continue
 
             if message == "/exit":
-                print("Shutting down immediately...")  # Immediate feedback
+                print("Shutting down immediately...")
                 shutdown_event.set()
                 for ws in connections.values():
                     if ws.state == State.OPEN:
@@ -64,7 +64,8 @@ async def user_input(discovery):
 
             if message.startswith("/connect "):
                 peer_ip = message[len("/connect "):].strip()
-                asyncio.create_task(connect_to_peer(peer_ip))
+                requesting_username = user_data.get("original_username", "unknown")
+                asyncio.create_task(connect_to_peer(peer_ip, requesting_username, None))
                 continue
 
             if message.startswith("/disconnect "):
@@ -80,6 +81,7 @@ async def user_input(discovery):
                 continue
 
             if message == "/peers":
+                own_ip = await get_own_ip()
                 if not connections:
                     print("\nNo connected peers.")
                 else:
@@ -87,7 +89,8 @@ async def user_input(discovery):
                     for peer_ip in connections:
                         username = next((u for u, ip in peer_usernames.items() if ip == peer_ip), "unknown")
                         device_id = peer_device_ids.get(peer_ip, "unknown")
-                        print(f"- {username}({device_id}) at {peer_ip}")
+                        suffix = " (self)" if peer_ip == own_ip else ""
+                        print(f"- {username}({device_id}) at {peer_ip}{suffix}")
                 continue
 
             if message.startswith("/msg "):

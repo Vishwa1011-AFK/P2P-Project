@@ -15,7 +15,7 @@ from networking.shared_state import (
 )
 from networking.utils import get_own_ip
 from networking.file_transfer import FileTransfer, TransferState
-from networking.messaging.utils import get_peer_display_name, connect_to_peer  # Added connect_to_peer
+from networking.messaging.utils import get_peer_display_name, connect_to_peer
 
 peer_list = {}
 
@@ -351,11 +351,15 @@ async def send_message_to_peers(message, target=None):
 async def maintain_peer_list(peer_discovery):
     while not shutdown_event.is_set():
         try:
-            peers = peer_discovery.peer_list.keys()
-            for peer_ip in peers:
+            peers = peer_discovery.peer_list  # Dictionary of {peer_ip: (username, timestamp)}
+            requesting_username = user_data.get("original_username", "unknown")
+            own_ip = await get_own_ip()
+            for peer_ip, (target_username, _) in peers.items():
+                if peer_ip == own_ip:  # Skip self
+                    continue
                 if peer_ip not in connections and peer_ip not in peer_list:
                     peer_list[peer_ip] = True
-                    asyncio.create_task(connect_to_peer(peer_ip))
+                    asyncio.create_task(connect_to_peer(peer_ip, requesting_username, target_username))
             await asyncio.sleep(10)
         except Exception as e:
             logging.error(f"Error in maintain_peer_list: {e}")
