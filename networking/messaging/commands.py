@@ -43,6 +43,7 @@ async def user_input(discovery):
                 print("  /connect <ip> - Connect to a peer by IP")
                 print("  /disconnect <display_name_or_username> - Disconnect from a peer")
                 print("  /peers - List connected peers")
+                print("  /list - List active peers by username and IP")
                 print("  /msg <display_name_or_username_or_groupname> <message> - Send a message")
                 print("  /send <display_name_or_username_or_groupname> <file_path> - Send a file or folder")
                 print("  /accept_file <transfer_id> - Accept a file transfer")
@@ -91,6 +92,17 @@ async def user_input(discovery):
                         device_id = peer_device_ids.get(peer_ip, "unknown")
                         suffix = " (self)" if peer_ip == own_ip else ""
                         print(f"- {username}({device_id}) at {peer_ip}{suffix}")
+                continue
+
+            if message == "/list":
+                own_ip = await get_own_ip()
+                if not peer_usernames:
+                    print("\nNo active peers in the network.")
+                else:
+                    print("\nActive peers in the network:")
+                    for username, peer_ip in peer_usernames.items():
+                        suffix = " (self)" if peer_ip == own_ip else ""
+                        print(f"- {username} ({peer_ip}){suffix}")
                 continue
 
             if message.startswith("/msg "):
