@@ -5,8 +5,8 @@ from aioconsole import ainput
 from websockets.connection import State
 from networking.shared_state import (
     connections, message_queue, active_transfers, user_data, peer_public_keys,
-    peer_usernames, peer_device_ids, shutdown_event, groups, pending_invites, pending_join_requests,
-    pending_approvals
+    peer_usernames, peer_device_ids, shutdown_event, groups, pending_invites, 
+    pending_join_requests, pending_approvals, username_to_ip, completed_transfers
 )
 from networking.messaging.core import send_message_to_peers
 from networking.messaging.groups import (
@@ -40,10 +40,10 @@ async def user_input(discovery):
             if message == "/help":
                 print("\nAvailable commands:")
                 print("  /exit - Shut down the application")
-                print("  /connect <ip> - Connect to a peer by IP")
+                print("  /connect <display_name_or_username> - Connect to a peer by username or display name")
                 print("  /disconnect <display_name_or_username> - Disconnect from a peer")
                 print("  /peers - List connected peers")
-                print("  /list - List active peers by username and IP")
+                print("  /list - List active peers in the network")
                 print("  /msg <display_name_or_username_or_groupname> <message> - Send a message")
                 print("  /send <display_name_or_username_or_groupname> <file_path> - Send a file or folder")
                 print("  /accept_file <transfer_id> - Accept a file transfer")
@@ -65,21 +65,14 @@ async def user_input(discovery):
                 continue
 
             if message.startswith("/connect "):
-                peer_ip = message[len("/connect "):].strip()
+                target_identifier = message[len("/connect "):].strip()
                 requesting_username = user_data.get("original_username", "unknown")
-                asyncio.create_task(connect_to_peer(peer_ip, requesting_username, None))
+                asyncio.create_task(connect_to_peer(target_identifier, requesting_username))
                 continue
 
             if message.startswith("/disconnect "):
                 identifier = message[len("/disconnect "):].strip()
-                result, status = await resolve_peer_target(identifier)
-                if status == "found":
-                    await disconnect_from_peer(result)
-                    print(f"Disconnected from {get_peer_display_name(result)}")
-                elif status == "not_found":
-                    print(f"No connected peer found matching: {identifier}")
-                else:
-                    print(f"Ambiguous target '{identifier}'. Matches: {', '.join(result)}")
+                await disconnect_from_peer(identifier)  # Already updated in utils.py to handle usernames
                 continue
 
             if message == "/peers":
@@ -89,21 +82,20 @@ async def user_input(discovery):
                 else:
                     print("\nConnected peers:")
                     for peer_ip in connections:
-                        username = next((u for u, ip in peer_usernames.items() if ip == peer_ip), "unknown")
-                        device_id = peer_device_ids.get(peer_ip, "unknown")
+                        display_name = get_peer_display_name(peer_ip)
                         suffix = " (self)" if peer_ip == own_ip else ""
-                        print(f"- {username}({device_id}) at {peer_ip}{suffix}")
+                        print(f"- {display_name}{suffix}")
                 continue
 
             if message == "/list":
                 own_ip = await get_own_ip()
-                if not peer_usernames:
+                if not username_to_ip:
                     print("\nNo active peers in the network.")
                 else:
                     print("\nActive peers in the network:")
-                    for username, peer_ip in peer_usernames.items():
+                    for display_name, peer_ip in username_to_ip.items():
                         suffix = " (self)" if peer_ip == own_ip else ""
-                        print(f"- {username} ({peer_ip}){suffix}")
+                        print(f"- {display_name}{suffix}")
                 continue
 
             if message == "/banned":
@@ -129,8 +121,8 @@ async def user_input(discovery):
                         await message_queue.put(f"You (to {get_peer_display_name(peer_ip)}): {msg_content}")
                     else:
                         print(f"Failed to send message to {get_peer_display_name(peer_ip)}.")
-                elif target_identifier in groups and await get_own_ip() in groups[target_identifier]["members"]:
-                    member_ips = [ip for ip in groups[target_identifier]["members"] if ip != await get_own_ip()]
+                elif status == "group":
+                    member_ips = [ip for ip in result if ip != await get_own_ip()]
                     if await send_message_to_peers(msg_content, member_ips):
                         await message_queue.put(f"You (to {target_identifier}): {msg_content}")
                     else:
@@ -158,9 +150,9 @@ async def user_input(discovery):
                         print(f"Starting send '{os.path.basename(file_path)}' to {get_peer_display_name(peer_ip)}...")
                         asyncio.create_task(send_file(file_path, {peer_ip: ws}))
                     else:
-                        print(f"Error: Connection invalid for {get_peer_display_name(peer_ip)}.")
-                elif target_identifier in groups and await get_own_ip() in groups[target_identifier]["members"]:
-                    peers = {ip: connections[ip] for ip in groups[target_identifier]["members"] if ip in connections and connections[ip].state == State.OPEN}
+                        print(f"Error: No active connection to {get_peer_display_name(peer_ip)}.")
+                elif status == "group":
+                    peers = {ip: connections[ip] for ip in result if ip in connections and connections[ip].state == State.OPEN}
                     if peers:
                         print(f"Starting send '{os.path.basename(file_path)}' to group '{target_identifier}'...")
                         asyncio.create_task(send_file(file_path, peers))
@@ -183,8 +175,8 @@ async def user_input(discovery):
                     transfer.file_handle = await aiofiles.open(transfer.file_path, "wb")
                     ws = connections.get(transfer.peer_ip)
                     if ws and ws.state == State.OPEN:
-                        await ws.send(json.dumps({"type": "file_transfer_response", "transfer_id": transfer_id, "approved": True}))
-                        await message_queue.put(f"Accepted file transfer '{transfer.file_path}' from {get_peer_display_name(transfer.peer_ip)}")
+                        await ws.send(json.dumps({"type": "FILE_TRANSFER_RESPONSE", "transfer_id": transfer_id, "approved": True}))
+                        await message_queue.put(f"Accepted file transfer '{os.path.basename(transfer.file_path)}' from {get_peer_display_name(transfer.peer_ip)}")
                     else:
                         transfer.state = TransferState.FAILED
                         del active_transfers[transfer_id]
@@ -199,9 +191,9 @@ async def user_input(discovery):
                 if transfer and transfer.direction == "receive" and transfer.state == TransferState.PENDING:
                     ws = connections.get(transfer.peer_ip)
                     if ws and ws.state == State.OPEN:
-                        await ws.send(json.dumps({"type": "file_transfer_response", "transfer_id": transfer_id, "approved": False}))
+                        await ws.send(json.dumps({"type": "FILE_TRANSFER_RESPONSE", "transfer_id": transfer_id, "approved": False}))
                     del active_transfers[transfer_id]
-                    await message_queue.put(f"Denied file transfer '{transfer.file_path}' from {get_peer_display_name(transfer.peer_ip)}")
+                    await message_queue.put(f"Denied file transfer '{os.path.basename(transfer.file_path)}' from {get_peer_display_name(transfer.peer_ip)}")
                 else:
                     print(f"No pending file transfer with ID '{transfer_id}'")
                 continue
@@ -302,11 +294,8 @@ async def user_input(discovery):
                 if groupname in groups:
                     print(f"Group '{groupname}' already exists.")
                 else:
-                    own_ip = await get_own_ip()
-                    groups[groupname]["admin"] = own_ip
-                    groups[groupname]["members"].add(own_ip)
                     await send_group_create_message(groupname)
-                    print(f"Group '{groupname}' created.")
+                    # Local state update happens via GROUP_CREATE message handler in utils.py
                 continue
 
             if message.startswith("/group_invite "):
@@ -331,34 +320,25 @@ async def user_input(discovery):
 
             if message.startswith("/accept_invite "):
                 groupname = message[len("/accept_invite "):].strip()
-                if groupname not in groups:
-                    print(f"Group '{groupname}' does not exist.")
+                own_ip = await get_own_ip()
+                invite = next(((g, i) for g, i in pending_invites[own_ip] if g == groupname), None)
+                if not invite:
+                    print(f"No pending invite for '{groupname}'")
                 else:
-                    own_ip = await get_own_ip()
-                    invite = next(((g, i) for g, i in pending_invites[own_ip] if g == groupname), None)
-                    if not invite:
-                        print(f"No pending invite for '{groupname}'")
-                    else:
-                        pending_invites[own_ip].remove(invite)
-                        await send_group_invite_response(groupname, invite[1], True)
-                        groups[groupname]["members"].add(own_ip)
-                        await send_group_update_message(groupname, groups[groupname]["members"])
-                        print(f"Accepted invite to '{groupname}'")
+                    pending_invites[own_ip].remove(invite)
+                    await send_group_invite_response(groupname, invite[1], True)
+                    # Local state update happens via GROUP_INVITE_RESPONSE handler
                 continue
 
             if message.startswith("/decline_invite "):
                 groupname = message[len("/decline_invite "):].strip()
-                if groupname not in groups:
-                    print(f"Group '{groupname}' does not exist.")
+                own_ip = await get_own_ip()
+                invite = next(((g, i) for g, i in pending_invites[own_ip] if g == groupname), None)
+                if not invite:
+                    print(f"No pending invite for '{groupname}'")
                 else:
-                    own_ip = await get_own_ip()
-                    invite = next(((g, i) for g, i in pending_invites[own_ip] if g == groupname), None)
-                    if not invite:
-                        print(f"No pending invite for '{groupname}'")
-                    else:
-                        pending_invites[own_ip].remove(invite)
-                        await send_group_invite_response(groupname, invite[1], False)
-                        print(f"Declined invite to '{groupname}'")
+                    pending_invites[own_ip].remove(invite)
+                    await send_group_invite_response(groupname, invite[1], False)
                 continue
 
             if message.startswith("/group_join "):
@@ -367,17 +347,14 @@ async def user_input(discovery):
                     print("Usage: /group_join <groupname> <admin_display_name_or_username>")
                 else:
                     groupname, admin_identifier = parts
-                    if groupname not in groups:
-                        print(f"Group '{groupname}' does not exist.")
+                    result, status = await resolve_peer_target(admin_identifier)
+                    if status == "found":
+                        await send_group_join_request(groupname, result)
+                        print(f"Sent join request for '{groupname}' to {get_peer_display_name(result)}")
+                    elif status == "not_found":
+                        print(f"No connected peer found matching: {admin_identifier}")
                     else:
-                        result, status = await resolve_peer_target(admin_identifier)
-                        if status == "found":
-                            await send_group_join_request(groupname, result)
-                            print(f"Sent join request for '{groupname}' to {get_peer_display_name(result)}")
-                        elif status == "not_found":
-                            print(f"No connected peer found matching: {admin_identifier}")
-                        else:
-                            print(f"Ambiguous target '{admin_identifier}'. Matches: {', '.join(result)}")
+                        print(f"Ambiguous target '{admin_identifier}'. Matches: {', '.join(result)}")
                 continue
 
             if message.startswith("/approve_join "):
@@ -458,7 +435,7 @@ async def user_input(discovery):
                         asyncio.create_task(receive_peer_messages(approval_data["websocket"], peer_ip))
                         del pending_approvals[peer_ip]
                         approved = True
-                        await message_queue.put(f"Connected to {username}({approval_data['device_id']}) at {peer_ip}")
+                        await message_queue.put(f"Connected to {username}({approval_data['device_id'][:8]})")
                         break
                 if not approved:
                     print(f"No pending connection request from '{username}'")

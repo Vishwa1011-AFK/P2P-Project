@@ -1,7 +1,7 @@
 import json
 from websockets.connection import State
 from networking.shared_state import connections, groups, pending_invites, message_queue
-from networking.messaging.utils import get_own_ip
+from networking.messaging.helpers import get_own_ip
 
 async def send_group_create_message(groupname):
     own_ip = await get_own_ip()
