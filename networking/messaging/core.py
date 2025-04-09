@@ -11,11 +11,13 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import serialization
 from networking.shared_state import (
     active_transfers, completed_transfers, message_queue, connections, user_data, peer_public_keys, 
-    peer_usernames, shutdown_event, pending_approvals, connection_denials
+    peer_usernames, peer_device_ids, shutdown_event, pending_approvals, connection_denials,
+    groups, pending_invites, pending_join_requests
 )
 from networking.utils import get_own_ip
 from networking.file_transfer import FileTransfer, TransferState
 from networking.messaging.utils import get_peer_display_name, connect_to_peer
+from networking.messaging.groups import send_group_update_message
 
 peer_list = {}
 
@@ -37,7 +39,7 @@ async def handle_incoming_connection(websocket, peer_ip):
                         await websocket.close(code=1000, reason="Already connected")
                         break
 
-                    if username in user_data["banned_users"]:
+                    if "banned_users" in user_data and username in user_data["banned_users"]:
                         await websocket.close(code=1008, reason="User is banned")
                         break
 
@@ -45,7 +47,7 @@ async def handle_incoming_connection(websocket, peer_ip):
                     peer_usernames[username] = peer_ip
                     peer_device_ids[peer_ip] = device_id
 
-                    if user_data["connection_approval"] == "manual":
+                    if user_data.get("connection_approval", "auto") == "manual":
                         requesting_username = f"{username}({device_id})"
                         pending_approvals[peer_ip] = {"username": username, "device_id": device_id, "websocket": websocket}
                         await message_queue.put({"type": "approval_request", "requesting_username": requesting_username})
@@ -87,7 +89,7 @@ async def handle_incoming_connection(websocket, peer_ip):
     return False
 
 async def receive_peer_messages(websocket, peer_ip):
-    folder_transfers = {}  # {folder_id: base_dir}
+    folder_transfers = {}
     try:
         async for message in websocket:
             if shutdown_event.is_set():
@@ -98,166 +100,161 @@ async def receive_peer_messages(websocket, peer_ip):
                 data = json.loads(message)
                 message_type = data.get("type")
 
-                if message_type == "file_transfer_request":
-                    transfer_id = data["transfer_id"]
-                    file_name = data["filename"]
-                    file_size = data["filesize"]
-                    expected_hash = data.get("file_hash")
-                    folder_id = data.get("folder_id")
-                    peer_username = next((u for u, ip in peer_usernames.items() if ip == peer_ip), "unknown")
-                    file_size_mb = file_size / (1024 * 1024)
-                    await message_queue.put({
-                        "type": "file_transfer_approval",
-                        "transfer_id": transfer_id,
-                        "peer_ip": peer_ip,
-                        "message": f"Do you want to accept '{file_name}' from {peer_username} of {file_size_mb:.2f} MB? (/accept_file {transfer_id} or /deny_file {transfer_id})"
-                    })
-                    if folder_id:
-                        folder_transfers[folder_id] = os.path.dirname(file_name)
+                if message_type == "MESSAGE":
+                    signature = bytes.fromhex(data["signature"])
+                    message_content = data["message"].encode()
+                    sender_public_key = peer_public_keys.get(peer_ip)
 
-                elif message_type == "file_transfer_response":
+                    if not sender_public_key:
+                        logging.warning(f"No public key for {peer_ip}, dropping message")
+                        continue
+
+                    sender_public_key.verify(
+                        signature,
+                        message_content,
+                        padding.PSS(
+                            mgf=padding.MGF1(hashes.SHA256()),
+                            salt_length=padding.PSS.MAX_LENGTH
+                        ),
+                        hashes.SHA256()
+                    )
+                    sender_display_name = get_peer_display_name(peer_ip)
+                    await message_queue.put(f"{sender_display_name}: {data['message']}")
+
+                elif message_type == "FILE_TRANSFER":
+                    transfer_id = data["transfer_id"]
+                    file_path = data["file_path"]
+                    total_size = data["file_size"]
+                    folder_id = data.get("folder_id")
+
+                    if folder_id and folder_id in folder_transfers:
+                        folder_transfers[folder_id].append(transfer_id)
+                    elif folder_id:
+                        folder_transfers[folder_id] = [transfer_id]
+
+                    file_transfer = FileTransfer(peer_ip, "receive", file_path, total_size, transfer_id, folder_id=folder_id)
+                    active_transfers[transfer_id] = file_transfer
+
+                    approval_msg = {
+                        "type": "file_transfer_approval",
+                        "message": f"Receiving '{os.path.basename(file_path)}' ({total_size / (1024 * 1024):.2f} MB) from {get_peer_display_name(peer_ip)}. Accept? (/accept_file {transfer_id} or /deny_file {transfer_id})"
+                    }
+                    await message_queue.put(approval_msg)
+
+                elif message_type == "FILE_DATA":
+                    transfer_id = data["transfer_id"]
+                    chunk = bytes.fromhex(data["chunk"])
+                    transfer = active_transfers.get(transfer_id)
+
+                    if not transfer or transfer.state != TransferState.IN_PROGRESS:
+                        continue
+
+                    await transfer.file_handle.write(chunk)
+                    transfer.transferred_size += len(chunk)
+
+                    if transfer.transferred_size >= transfer.total_size:
+                        await transfer.file_handle.close()
+                        transfer.state = TransferState.COMPLETED
+                        completed_transfers[transfer_id] = {
+                            "direction": transfer.direction,
+                            "file_path": transfer.file_path,
+                            "total_size": transfer.total_size,
+                            "transferred_size": transfer.transferred_size,
+                            "state": transfer.state.value,
+                            "peer_ip": transfer.peer_ip
+                        }
+                        del active_transfers[transfer_id]
+                        folder_id = transfer.folder_id
+                        if folder_id and folder_id in folder_transfers and transfer_id in folder_transfers[folder_id]:
+                            folder_transfers[folder_id].remove(transfer_id)
+                            if not folder_transfers[folder_id]:
+                                del folder_transfers[folder_id]
+                                await message_queue.put(f"Folder transfer {folder_id} completed from {get_peer_display_name(peer_ip)}")
+                        await message_queue.put(f"Received '{os.path.basename(transfer.file_path)}' from {get_peer_display_name(peer_ip)}")
+
+                elif message_type == "FILE_TRANSFER_RESPONSE":
                     transfer_id = data["transfer_id"]
                     approved = data["approved"]
                     transfer = active_transfers.get(transfer_id)
+
                     if transfer and transfer.direction == "send":
                         if approved:
                             transfer.state = TransferState.IN_PROGRESS
-                            await message_queue.put(f"File transfer '{os.path.basename(transfer.file_path)}' approved by {get_peer_display_name(peer_ip)}.")
+                            asyncio.create_task(send_file_chunks(transfer, websocket))
                         else:
+                            transfer.state = TransferState.FAILED
                             del active_transfers[transfer_id]
-                            await message_queue.put(f"File transfer '{os.path.basename(transfer.file_path)}' denied by {get_peer_display_name(peer_ip)}.")
-
-                elif message_type == "file_chunk":
-                    transfer_id = data["transfer_id"]
-                    transfer = active_transfers.get(transfer_id)
-                    if transfer and transfer.direction == "receive":
-                        async with transfer.condition:
-                            while transfer.state == TransferState.PAUSED and not shutdown_event.is_set():
-                                await transfer.condition.wait()
-                            if shutdown_event.is_set():
-                                await transfer.file_handle.close()
-                                del active_transfers[transfer_id]
-                                break
-                        chunk = bytes.fromhex(data["chunk"])
-                        await transfer.file_handle.write(chunk)
-                        transfer.transferred_size += len(chunk)
-                        if transfer.hash_algo:
-                            transfer.hash_algo.update(chunk)
-                        if transfer.transferred_size >= transfer.total_size:
-                            await transfer.file_handle.close()
-                            transfer.file_handle = None
-                            if transfer.expected_hash:
-                                calculated_hash = transfer.hash_algo.hexdigest()
-                                if calculated_hash != transfer.expected_hash:
-                                    os.remove(transfer.file_path)
-                                    transfer.state = TransferState.FAILED
-                                    await message_queue.put(f"File transfer failed: integrity check failed for '{transfer.file_path}'")
-                                else:
-                                    if transfer.folder_id:
-                                        base_dir = folder_transfers.get(transfer.folder_id, "downloads")
-                                        final_path = os.path.join("downloads", transfer.file_path)
-                                        os.makedirs(os.path.dirname(final_path), exist_ok=True)
-                                        os.rename(transfer.file_path, final_path)
-                                        transfer.file_path = final_path
-                                    transfer.state = TransferState.COMPLETED
-                                    await message_queue.put(f"File saved as: {transfer.file_path}")
-                            else:
-                                transfer.state = TransferState.COMPLETED
-                                await message_queue.put(f"File saved as: {transfer.file_path}")
-                            completed_transfers[transfer_id] = {
-                                "file_path": transfer.file_path,
-                                "peer_ip": transfer.peer_ip,
-                                "direction": transfer.direction,
-                                "total_size": transfer.total_size,
-                                "transferred_size": transfer.transferred_size,
-                                "state": transfer.state.value,
-                                "folder_id": transfer.folder_id
-                            }
-                            del active_transfers[transfer_id]
+                            await message_queue.put(f"File transfer '{os.path.basename(transfer.file_path)}' to {get_peer_display_name(peer_ip)} denied by recipient")
 
                 elif message_type == "TRANSFER_PAUSE":
                     transfer_id = data["transfer_id"]
                     transfer = active_transfers.get(transfer_id)
-                    if transfer and transfer.direction == "receive":
+                    if transfer and transfer.state == TransferState.IN_PROGRESS:
                         await transfer.pause(peer_ip)
+                        await message_queue.put(f"Transfer {transfer_id[:8]} paused by {get_peer_display_name(peer_ip)}")
 
                 elif message_type == "TRANSFER_RESUME":
                     transfer_id = data["transfer_id"]
                     transfer = active_transfers.get(transfer_id)
-                    if transfer and transfer.direction == "receive":
+                    if transfer and transfer.state == TransferState.PAUSED:
                         await transfer.resume(peer_ip)
-
-                elif message_type == "MESSAGE":
-                    decrypted_message = user_data["private_key"].decrypt(
-                        bytes.fromhex(data["message"]),
-                        padding.OAEP(
-                            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                            algorithm=hashes.SHA256(),
-                            label=None
-                        )
-                    ).decode()
-                    peer_username = next((u for u, ip in peer_usernames.items() if ip == peer_ip), "unknown")
-                    await message_queue.put(f"{peer_username}: {decrypted_message}")
+                        if transfer.direction == "send":
+                            asyncio.create_task(send_file_chunks(transfer, websocket))
+                        await message_queue.put(f"Transfer {transfer_id[:8]} resumed by {get_peer_display_name(peer_ip)}")
 
                 elif message_type == "GROUP_CREATE":
                     groupname = data["groupname"]
-                    admin_ip = data["admin_ip"]
-                    from networking.shared_state import groups
-                    groups[groupname]["admin"] = admin_ip
-                    groups[groupname]["members"].add(admin_ip)
-                    await message_queue.put(f"Group '{groupname}' created by {get_peer_display_name(admin_ip)}")
+                    admin_ip = peer_ip
+                    groups[groupname] = {"admin": admin_ip, "members": {admin_ip}}
+                    await message_queue.put(f"Group '{groupname}' created by {get_peer_display_name(peer_ip)}")
 
                 elif message_type == "GROUP_INVITE":
                     groupname = data["groupname"]
-                    inviter_ip = data["inviter_ip"]
-                    from networking.shared_state import pending_invites
                     own_ip = await get_own_ip()
-                    pending_invites[own_ip].add((groupname, inviter_ip))
-                    await message_queue.put(f"Received invite to join '{groupname}' from {get_peer_display_name(inviter_ip)}")
+                    pending_invites[own_ip].append((groupname, peer_ip))
+                    await message_queue.put(f"Invited to group '{groupname}' by {get_peer_display_name(peer_ip)}. (/accept_invite {groupname} or /decline_invite {groupname})")
 
                 elif message_type == "GROUP_INVITE_RESPONSE":
                     groupname = data["groupname"]
-                    invitee_ip = data["invitee_ip"]
                     accepted = data["accepted"]
-                    own_ip = await get_own_ip()
-                    if own_ip == groups[groupname]["admin"] and accepted:
-                        groups[groupname]["members"].add(invitee_ip)
+                    member_ip = peer_ip
+                    if accepted and groupname in groups and await get_own_ip() == groups[groupname]["admin"]:
+                        groups[groupname]["members"].add(member_ip)
                         await send_group_update_message(groupname, groups[groupname]["members"])
-                        await message_queue.put(f"{get_peer_display_name(invitee_ip)} joined '{groupname}'")
+                        await message_queue.put(f"{get_peer_display_name(member_ip)} accepted invite to '{groupname}'")
+                    elif not accepted:
+                        await message_queue.put(f"{get_peer_display_name(member_ip)} declined invite to '{groupname}'")
 
                 elif message_type == "GROUP_JOIN_REQUEST":
                     groupname = data["groupname"]
-                    requester_ip = data["requester_ip"]
-                    requester_username = data["requester_username"]
-                    own_ip = await get_own_ip()
-                    from networking.shared_state import pending_join_requests
-                    if own_ip == groups[groupname]["admin"]:
-                        pending_join_requests[groupname].append({"ip": requester_ip, "username": requester_username})
-                        await message_queue.put(f"Join request for '{groupname}' from {requester_username}")
+                    requester_ip = peer_ip
+                    requester_username = next((u for u, ip in peer_usernames.items() if ip == requester_ip), "unknown")
+                    if groupname in groups and await get_own_ip() == groups[groupname]["admin"]:
+                        pending_join_requests[groupname].append({"username": requester_username, "ip": requester_ip})
+                        await message_queue.put(f"{requester_username} requests to join '{groupname}'. (/approve_join {groupname} {requester_username} or /deny_join {groupname} {requester_username})")
 
                 elif message_type == "GROUP_JOIN_RESPONSE":
                     groupname = data["groupname"]
-                    requester_ip = data["requester_ip"]
                     approved = data["approved"]
                     own_ip = await get_own_ip()
-                    if own_ip == requester_ip and approved:
+                    if approved and groupname in groups:
                         groups[groupname]["members"].add(own_ip)
                         await message_queue.put(f"You have joined '{groupname}'")
+                    elif not approved:
+                        await message_queue.put(f"Join request for '{groupname}' denied")
 
                 elif message_type == "GROUP_UPDATE":
                     groupname = data["groupname"]
                     members = set(data["members"])
-                    own_ip = await get_own_ip()
-                    if own_ip in members:
+                    if groupname in groups:
                         groups[groupname]["members"] = members
-                        await message_queue.put(f"Group '{groupname}' updated with members: {', '.join(map(get_peer_display_name, members))}")
-
-                else:
-                    logging.info(f"Received unknown control message from {peer_ip}: {data}")
+                        await message_queue.put(f"Group '{groupname}' updated. New member list: {', '.join(get_peer_display_name(ip) for ip in members)}")
 
             except json.JSONDecodeError:
                 peer_username = next((u for u, ip in peer_usernames.items() if ip == peer_ip), "unknown")
                 await message_queue.put(f"{peer_username}: {message}")
+            except Exception as e:
+                logging.error(f"Error processing message from {peer_ip}: {e}")
 
     except websockets.exceptions.ConnectionClosed:
         if peer_ip in connections:
@@ -269,7 +266,6 @@ async def receive_peer_messages(websocket, peer_ip):
         username = next((u for u, ip in peer_usernames.items() if ip == peer_ip), None)
         if username:
             del peer_usernames[username]
-        from networking.shared_state import groups
         for groupname in list(groups.keys()):
             if peer_ip in groups[groupname]["members"]:
                 groups[groupname]["members"].remove(peer_ip)
@@ -287,82 +283,99 @@ async def send_message_to_peers(message, target=None):
     success = False
     if shutdown_event.is_set():
         return success
+    own_ip = await get_own_ip()
+    signature = user_data["private_key"].sign(
+        message.encode(),
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=padding.PSS.MAX_LENGTH
+        ),
+        hashes.SHA256()
+    )
+    message_data = json.dumps({
+        "type": "MESSAGE",
+        "message": message,
+        "signature": signature.hex()
+    })
 
-    if isinstance(target, list):  # Group message
-        for peer_ip in target:
-            if peer_ip in connections and connections[peer_ip].state == State.OPEN:
-                try:
-                    encrypted_message = peer_public_keys[peer_ip].encrypt(
-                        message.encode(),
-                        padding.OAEP(
-                            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                            algorithm=hashes.SHA256(),
-                            label=None
-                        )
-                    ).hex()
-                    await connections[peer_ip].send(
-                        json.dumps({"type": "MESSAGE", "message": encrypted_message})
-                    )
-                    success = True
-                except Exception as e:
-                    logging.error(f"Failed to send message to {peer_ip}: {e}")
-    elif target:  # Single peer
-        peer_ip = peer_usernames.get(target, target)
-        if peer_ip in connections and connections[peer_ip].state == State.OPEN:
+    if isinstance(target, str):
+        ws = connections.get(target)
+        if ws and ws.state == State.OPEN:
             try:
-                encrypted_message = peer_public_keys[peer_ip].encrypt(
-                    message.encode(),
-                    padding.OAEP(
-                        mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                        algorithm=hashes.SHA256(),
-                        label=None
-                    )
-                ).hex()
-                await connections[peer_ip].send(
-                    json.dumps({"type": "MESSAGE", "message": encrypted_message})
-                )
+                await ws.send(message_data)
                 success = True
             except Exception as e:
-                logging.error(f"Failed to send message to {peer_ip}: {e}")
-    else:
-        # Broadcast to all
-        for peer_ip, websocket in list(connections.items()):
-            if websocket.state == State.OPEN:
+                logging.error(f"Failed to send message to {target}: {e}")
+        return success
+    elif isinstance(target, list):
+        for peer_ip in target:
+            ws = connections.get(peer_ip)
+            if ws and ws.state == State.OPEN:
                 try:
-                    encrypted_message = peer_public_keys[peer_ip].encrypt(
-                        message.encode(),
-                        padding.OAEP(
-                            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                            algorithm=hashes.SHA256(),
-                            label=None
-                        )
-                    ).hex()
-                    await websocket.send(
-                        json.dumps({"type": "MESSAGE", "message": encrypted_message})
-                    )
+                    await ws.send(message_data)
                     success = True
                 except Exception as e:
                     logging.error(f"Failed to send message to {peer_ip}: {e}")
-                    if websocket.state == State.OPEN:
-                        await websocket.close(code=1011, reason="Internal error")
+        return success
+    else:
+        for peer_ip, ws in list(connections.items()):
+            if peer_ip == own_ip:
+                continue
+            if ws.state == State.OPEN:
+                try:
+                    await ws.send(message_data)
+                    success = True
+                except Exception as e:
+                    logging.error(f"Failed to send message to {peer_ip}: {e}")
+        return success
 
-    return success
+async def send_file_chunks(transfer, websocket):
+    try:
+        async with aiofiles.open(transfer.file_path, "rb") as f:
+            while transfer.state == TransferState.IN_PROGRESS:
+                chunk = await f.read(1024 * 1024)  # 1MB chunks
+                if not chunk:
+                    break
+                await websocket.send(json.dumps({
+                    "type": "FILE_DATA",
+                    "transfer_id": transfer.transfer_id,
+                    "chunk": chunk.hex()
+                }))
+                transfer.transferred_size += len(chunk)
+                await asyncio.sleep(0.01)  # Prevent overwhelming the network
+            if transfer.transferred_size >= transfer.total_size:
+                transfer.state = TransferState.COMPLETED
+                completed_transfers[transfer.transfer_id] = {
+                    "direction": transfer.direction,
+                    "file_path": transfer.file_path,
+                    "total_size": transfer.total_size,
+                    "transferred_size": transfer.transferred_size,
+                    "state": transfer.state.value,
+                    "peer_ip": transfer.peer_ip
+                }
+                del active_transfers[transfer.transfer_id]
+                await message_queue.put(f"Sent '{os.path.basename(transfer.file_path)}' to {get_peer_display_name(transfer.peer_ip)}")
+    except Exception as e:
+        transfer.state = TransferState.FAILED
+        del active_transfers[transfer.transfer_id]
+        await message_queue.put(f"Failed to send '{os.path.basename(transfer.file_path)}' to {get_peer_display_name(transfer.peer_ip)}: {e}")
 
 async def maintain_peer_list(peer_discovery):
     while not shutdown_event.is_set():
         try:
-            peers = peer_discovery.peer_list  # Dictionary of {peer_ip: (username, timestamp)}
+            peers = peer_discovery.peer_list
             requesting_username = user_data.get("original_username", "unknown")
             own_ip = await get_own_ip()
+            logging.info(f"Discovered peers: {peers}")
             for peer_ip, (target_username, _) in peers.items():
-                if peer_ip == own_ip:  # Skip self
+                if peer_ip == own_ip:
+                    logging.info(f"Skipping self-connection to {peer_ip}")
                     continue
                 if peer_ip not in connections and peer_ip not in peer_list:
                     peer_list[peer_ip] = True
+                    logging.info(f"Attempting to connect to {peer_ip} ({target_username})")
                     asyncio.create_task(connect_to_peer(peer_ip, requesting_username, target_username))
             await asyncio.sleep(10)
         except Exception as e:
             logging.error(f"Error in maintain_peer_list: {e}")
             await asyncio.sleep(10)
-
-from networking.messaging.groups import send_group_update_message

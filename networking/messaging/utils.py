@@ -11,38 +11,34 @@ from networking.shared_state import (
     shutdown_event, message_queue
 )
 from networking.utils import get_own_ip as network_get_own_ip
+from networking.messaging.core import receive_peer_messages
 
 def get_peer_display_name(peer_ip):
-    """Return the display name for a peer based on username and device ID."""
-    username = next((uname for uname, ip in peer_usernames.items() if ip == peer_ip), "Unknown")
-    device_id = peer_device_ids.get(peer_ip)
-    device_suffix = f"({device_id[:8]})" if device_id else "(?)"
+    username = next((uname for uname, ip in peer_usernames.items() if ip == peer_ip), "unknown")
+    device_id = peer_device_ids.get(peer_ip, "unknown")
+    device_suffix = f"({device_id[:8]})" if device_id != "unknown" else "(?)"
     username_count = sum(1 for ip in connections if get_peer_original_username(ip) == username)
-    return f"{username}{device_suffix}" if username_count > 1 or username == "Unknown" else username
+    return f"{username}{device_suffix}" if username_count > 1 or username == "unknown" else username
 
 def get_peer_original_username(peer_ip):
-    """Return the original username associated with a peer IP."""
     return next((uname for uname, ip in peer_usernames.items() if ip == peer_ip), None)
 
 def get_own_display_name():
-    """Return the display name for the local user."""
     username = user_data.get("original_username", "User")
     device_id = user_data.get("device_id")
     return f"{username}({device_id[:8]})" if device_id else username
 
 async def get_own_ip():
-    """Get the local machine's IP address."""
     return await network_get_own_ip()
 
 async def resolve_peer_target(target_identifier):
-    """Resolve a target identifier to a peer IP, handling ambiguity."""
     matches = []
     for peer_ip in connections:
         display_name = get_peer_display_name(peer_ip)
         original_username = get_peer_original_username(peer_ip)
         if target_identifier == display_name:
             matches.append(peer_ip)
-            if '(' in display_name:  # Exact match with device ID takes priority
+            if '(' in display_name:
                 return peer_ip, "found"
         elif target_identifier == original_username:
             matches.append(peer_ip)
@@ -55,11 +51,9 @@ async def resolve_peer_target(target_identifier):
         return [get_peer_display_name(ip) for ip in unique_matches], "ambiguous"
 
 def get_config_directory():
-    """Return the user configuration directory for storing keys and settings."""
     return user_config_dir("P2PChat", False)
 
 async def initialize_user_config():
-    """Initialize user configuration, including keys and username."""
     config_dir = get_config_directory()
     os.makedirs(config_dir, exist_ok=True)
 
@@ -75,7 +69,7 @@ async def initialize_user_config():
             user_data["public_key"] = serialization.load_pem_public_key(
                 data["public_key"].encode()
             )
-        await message_queue.put(f"Welcome back, {user_data['original_username']}!")
+            user_data["banned_users"] = data.get("banned_users", [])
     else:
         private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         public_key = private_key.public_key()
@@ -88,6 +82,7 @@ async def initialize_user_config():
         user_data["device_id"] = device_id
         user_data["private_key"] = private_key
         user_data["public_key"] = public_key
+        user_data["banned_users"] = []
 
         public_key_pem = public_key.public_bytes(
             encoding=serialization.Encoding.PEM,
@@ -104,13 +99,14 @@ async def initialize_user_config():
                 "username": username,
                 "device_id": device_id,
                 "private_key": private_key_pem,
-                "public_key": public_key_pem
+                "public_key": public_key_pem,
+                "banned_users": []
             }, f, indent=4)
-        await message_queue.put(f"Welcome, {username}! Your keys have been generated.")
+    await message_queue.put(f"Welcome back, {user_data['original_username']}!")
 
 async def connect_to_peer(peer_ip, requesting_username, target_username=None):
-    """Establish a WebSocket connection to a peer."""
-    if peer_ip == await get_own_ip():  # Prevent self-connection
+    if peer_ip == await get_own_ip():
+        await message_queue.put(f"Skipping connection to self ({peer_ip})")
         return
     uri = f"ws://{peer_ip}:8765"
     try:
@@ -118,7 +114,7 @@ async def connect_to_peer(peer_ip, requesting_username, target_username=None):
             public_key_pem = user_data["public_key"].public_bytes(
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PublicFormat.SubjectPublicKeyInfo
-            ).hex()  # Use .hex() for JSON compatibility
+            ).hex()
             hello_message = json.dumps({
                 "type": "HELLO",
                 "public_key": public_key_pem,
@@ -126,9 +122,6 @@ async def connect_to_peer(peer_ip, requesting_username, target_username=None):
                 "device_id": user_data["device_id"]
             })
             await websocket.send(hello_message)
-
-            # Wait for HELLO back or connection setup
-            from networking.messaging.core import receive_peer_messages
             connections[peer_ip] = websocket
             await receive_peer_messages(websocket, peer_ip)
     except (websockets.exceptions.WebSocketException, json.JSONDecodeError) as e:
@@ -139,7 +132,6 @@ async def connect_to_peer(peer_ip, requesting_username, target_username=None):
         await message_queue.put(f"Unexpected error connecting to {target} ({peer_ip}): {e}")
 
 async def disconnect_from_peer(peer_ip):
-    """Disconnect from a specific peer."""
     ws = connections.get(peer_ip)
     if ws and ws.state == State.OPEN:
         try:

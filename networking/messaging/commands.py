@@ -61,6 +61,7 @@ async def user_input(discovery):
                 print("  /group_members <groupname> - List group members")
                 print("  /approve <username> - Approve a pending connection")
                 print("  /deny <username> - Deny a pending connection")
+                print("  /banned - List banned users")
                 continue
 
             if message.startswith("/connect "):
@@ -103,6 +104,16 @@ async def user_input(discovery):
                     for username, peer_ip in peer_usernames.items():
                         suffix = " (self)" if peer_ip == own_ip else ""
                         print(f"- {username} ({peer_ip}){suffix}")
+                continue
+
+            if message == "/banned":
+                banned_users = user_data.get("banned_users", [])
+                if not banned_users:
+                    print("\nNo users are currently banned.")
+                else:
+                    print("\nBanned users:")
+                    for username in banned_users:
+                        print(f"- {username}")
                 continue
 
             if message.startswith("/msg "):
@@ -466,10 +477,13 @@ async def user_input(discovery):
                     print(f"No pending connection request from '{username}'")
                 continue
 
-            if await send_message_to_peers(message):
-                await message_queue.put(f"You: {message}")
-            else:
-                print("No peers connected to send the message.")
+            if not message.startswith("/"):
+                if await send_message_to_peers(message):
+                    await message_queue.put(f"You: {message}")
+                else:
+                    print("No peers connected to send the message.")
+            elif message.startswith("/li") and not message == "/list":
+                print("Did you mean /list? Type the full command to list active peers.")
 
         except Exception as e:
             print(f"Error in user_input: {e}")
