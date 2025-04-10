@@ -12,12 +12,13 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.exceptions import InvalidSignature
-import sys # Added for sys.exit
+import sys
 from networking.shared_state import (
     connections, user_data, peer_usernames, peer_device_ids, peer_public_keys,
     shutdown_event, message_queue, active_transfers, completed_transfers,
     groups, pending_invites, pending_join_requests, username_to_ip,
-    discovered_peers_by_username
+    discovered_peers_by_username,
+    pending_approvals
 )
 from networking.file_transfer import FileTransfer, TransferState
 from networking.messaging.helpers import get_peer_display_name, get_own_display_name, get_own_ip, get_peer_original_username
