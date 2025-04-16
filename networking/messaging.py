@@ -775,13 +775,29 @@ async def receive_peer_messages(websocket, peer_ip):
                 if transfer:
                     try:
                         async with transfer.condition:
-                            while transfer.state == TransferState.PAUSED and not shutdown_event.is_set():
-                                logger.debug(f"Receiving loop for {transfer.transfer_id[:8]} paused. Waiting...")
-                                await transfer.condition.wait()
-                            if shutdown_event.is_set(): break
-
+                            # Check transfer state before processing
+                            current_state = transfer.state
+                            logger.debug(f"Receiving binary data for transfer {transfer.transfer_id[:8]}, current state: {current_state}")
+                            
+                            # If paused, wait for resume
+                            if current_state == TransferState.PAUSED:
+                                logger.info(f"Transfer {transfer.transfer_id[:8]} paused - waiting for resume signal")
+                                try:
+                                    # Wait with timeout to prevent indefinite blocking
+                                    await asyncio.wait_for(transfer.condition.wait(), timeout=60.0)
+                                    logger.debug(f"Woke up from wait for {transfer.transfer_id[:8]}, new state: {transfer.state}")
+                                except asyncio.TimeoutError:
+                                    logger.warning(f"Timeout waiting for resume on transfer {transfer.transfer_id[:8]}")
+                                    if transfer.state == TransferState.PAUSED:
+                                        continue
+                            
+                            # Check if shutdown requested during wait
+                            if shutdown_event.is_set(): 
+                                break
+                                
+                            # Check state again after potential wait
                             if transfer.state != TransferState.IN_PROGRESS:
-                                logger.warning(f"Received binary data for non-active transfer {transfer.transfer_id[:8]} from {display_name}. State: {transfer.state}. Ignoring.")
+                                logger.warning(f"Cannot process binary data for transfer {transfer.transfer_id[:8]} - state: {transfer.state}")
                                 continue
 
                             if transfer.file_handle:
@@ -946,6 +962,7 @@ async def receive_peer_messages(websocket, peer_ip):
                         tid = data.get("transfer_id")
                         transfer = current_receiving_transfer
                         if transfer and transfer.transfer_id == tid:
+                           logger.debug(f"Processing PAUSE for transfer {tid[:8]}. Current state: {transfer.state}")
                            async with transfer.condition:
                                if transfer.state == TransferState.IN_PROGRESS:
                                    logger.info(f"Received PAUSE request for active transfer {tid[:8]} from {display_name}. Pausing.")
@@ -960,10 +977,13 @@ async def receive_peer_messages(websocket, peer_ip):
                         tid = data.get("transfer_id")
                         transfer = current_receiving_transfer
                         if transfer and transfer.transfer_id == tid:
+                           logger.debug(f"Processing RESUME for transfer {tid[:8]}. Current state: {transfer.state}")
                            async with transfer.condition:
                                if transfer.state == TransferState.PAUSED:
                                    logger.info(f"Received RESUME request for active transfer {tid[:8]} from {display_name}. Resuming.")
                                    await transfer.resume()
+                                   # Ensure notification happens
+                                   transfer.condition.notify_all()
                                    await message_queue.put({"type":"log","message":f"Transfer '{os.path.basename(transfer.file_path)}' resumed by {display_name}."})
                                else:
                                    logger.warning(f"Received RESUME for transfer {tid[:8]} from {display_name}, but current state is {transfer.state}.")
