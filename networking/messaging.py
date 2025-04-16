@@ -324,8 +324,8 @@ async def connect_to_peer(peer_ip, requesting_username, target_username, port=87
         websocket = await asyncio.wait_for(
             websockets.connect(
                 uri,
-                ping_interval=20,
-                ping_timeout=15,
+                ping_interval=None,  # Changed from 20 to None to disable keepalive pings
+                ping_timeout=None,   # Changed from 15 to None to disable ping timeout
                 max_size=10 * 1024 * 1024,
                 ssl=ssl_context
             ),
