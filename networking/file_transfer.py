@@ -5,54 +5,73 @@ import aiofiles
 import hashlib
 import logging
 import json
+import time
+import websockets
 from enum import Enum
-from networking.shared_state import active_transfers, shutdown_event
-from networking.shared_state import active_transfers, shutdown_event, active_transfers_lock, message_queue 
-import websockets 
-MAX_CHUNK_SIZE = 8 * 1024 * 1024
-MAX_TRANSFER_RETRIES = 3
-RETRY_BACKOFF_BASE = 2 
-peers_to_notify_completion = {} 
 
+from networking.shared_state import (
+    active_transfers, shutdown_event, message_queue,
+    active_transfers_lock, outgoing_transfers_by_peer
+)
+from websockets.connection import State
+from utils.file_validation import check_file_size, check_disk_space, safe_close_file
+
+logger = logging.getLogger(__name__)
 
 class TransferState(Enum):
     IN_PROGRESS = "in_progress"
     PAUSED = "paused"
     COMPLETED = "completed"
     FAILED = "failed"
-    UNKNOWN = "unknown" 
-    STARTING = "starting"  
 
 class FileTransfer:
-    def __init__(self, file_path, peer_ip, direction="send"):
+    def __init__(self, file_path, peer_ip, direction="send", transfer_id=None):
         self.file_path = file_path
         self.peer_ip = peer_ip
         self.direction = direction
-        self.transfer_id = str(uuid.uuid4())
-        try:
-             self.total_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
-        except OSError as e:
-             logging.error(f"Cannot get size for {file_path}: {e}")
-             self.total_size = 0
+        self.transfer_id = transfer_id if transfer_id else str(uuid.uuid4())
+        self.total_size = 0
         self.transferred_size = 0
         self.file_handle = None
         self.state = TransferState.IN_PROGRESS
         self.hash_algo = hashlib.sha256()
         self.expected_hash = None
         self.condition = asyncio.Condition()
+        self.start_time = time.time()
+        try:
+            if direction == "send" and os.path.exists(file_path):
+                self.total_size = os.path.getsize(file_path)
+        except OSError as e:
+            logger.error(f"Error getting size for {file_path}: {e}")
+            self.state = TransferState.FAILED
 
     async def pause(self):
         async with self.condition:
             if self.state == TransferState.IN_PROGRESS:
                 self.state = TransferState.PAUSED
-                logging.info(f"Transfer {self.transfer_id} paused.")
+                logger.info(f"Transfer {self.transfer_id[:8]} ({self.direction}) paused.")
+                await message_queue.put({"type": "transfer_update"})
 
     async def resume(self):
         async with self.condition:
             if self.state == TransferState.PAUSED:
                 self.state = TransferState.IN_PROGRESS
+                logger.info(f"Transfer {self.transfer_id[:8]} ({self.direction}) resumed.")
                 self.condition.notify_all()
-                logging.info(f"Transfer {self.transfer_id} resumed.")
+                await message_queue.put({"type": "transfer_update"})
+
+    async def fail(self, reason="Unknown"):
+        async with self.condition:
+             if self.state not in [TransferState.COMPLETED, TransferState.FAILED]:
+                logger.error(f"Transfer {self.transfer_id[:8]} ({self.direction}) failed: {reason}")
+                original_state = self.state
+                self.state = TransferState.FAILED
+                if self.file_handle:
+                    await safe_close_file(self.file_handle)
+                    self.file_handle = None
+                if original_state == TransferState.PAUSED:
+                    self.condition.notify_all()
+                await message_queue.put({"type": "transfer_update"})
 
 async def compute_hash(file_path):
     hash_algo = hashlib.sha256()
@@ -64,345 +83,283 @@ async def compute_hash(file_path):
                     break
                 hash_algo.update(chunk)
         return hash_algo.hexdigest()
-    except OSError as e:
-         logging.error(f"Error computing hash for {file_path}: {e}")
-         return None
+    except FileNotFoundError:
+        logger.error(f"File not found during hash computation: {file_path}")
+        return None
     except Exception as e:
-         logging.exception(f"Unexpected error computing hash for {file_path}: {e}")
-         return None
+        logger.error(f"Error computing hash for {file_path}: {e}", exc_info=True)
+        return None
 
-MAX_CONCURRENT_TRANSFERS = 5
-transfer_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TRANSFERS)
+async def send_file(file_path, peers):
+    if not os.path.isfile(file_path):
+        await message_queue.put({"type": "log", "message": f"Send Error: File not found '{file_path}'", "level": logging.ERROR})
+        return
+    if not peers:
+        await message_queue.put({"type": "log", "message": "Send Error: No peer specified.", "level": logging.ERROR})
+        return
 
-async def send_file(file_path, initial_peers, retry_count=0):
-    async with transfer_semaphore:
-        transfer_id = str(uuid.uuid4())
-        file_name = os.path.basename(file_path) 
-        if retry_count >= MAX_TRANSFER_RETRIES:
-            logging.error(f"Failed to send {file_name} after {MAX_TRANSFER_RETRIES} attempts (Transfer ID: {transfer_id}).")
-            async with active_transfers_lock:
-                if transfer_id in active_transfers:
-                    active_transfers[transfer_id].state = TransferState.FAILED
-                    active_transfers[transfer_id].error_message = f"Failed after {MAX_TRANSFER_RETRIES} retries."
-                else:
-                    await message_queue.put(f"Failed to send '{file_name}' after {MAX_TRANSFER_RETRIES} attempts.")
+    is_valid, message = check_file_size(file_path)
+    if not is_valid:
+        await message_queue.put({"type": "log", "message": f"Send Error: {message}", "level": logging.ERROR})
+        return
+
+    peer_ip, websocket = next(iter(peers.items()))
+    if not websocket or websocket.state != State.OPEN:
+         await message_queue.put({"type": "log", "message": f"Send Error: Peer {peer_ip} not connected.", "level": logging.ERROR})
+         return
+
+    async with active_transfers_lock:
+        if peer_ip in outgoing_transfers_by_peer:
+            existing_transfer_id = outgoing_transfers_by_peer[peer_ip]
+            await message_queue.put({
+                "type": "log",
+                "message": f"Send Error: Already sending file to {peer_ip} (ID: {existing_transfer_id[:8]}). Wait or cancel.",
+                "level": logging.ERROR
+            })
             return
 
-        logging.info(f"Attempting to send file: {file_name} (Transfer ID: {transfer_id}, Attempt: {retry_count + 1}/{MAX_TRANSFER_RETRIES})")
+    transfer_id = str(uuid.uuid4())
+    file_name = os.path.basename(file_path)
+    file_size = os.path.getsize(file_path)
+    file_hash = await compute_hash(file_path)
 
-        try:
-            file_size = os.path.getsize(file_path)
-        except OSError as e:
-            logging.error(f"Cannot send file {file_path} (Transfer ID: {transfer_id}): {e}")
-            await message_queue.put(f"Error sending '{file_name}': Cannot access file.")
-            return
+    if file_hash is None:
+        await message_queue.put({"type": "log", "message": f"Send Error: Could not compute hash for '{file_name}'.", "level": logging.ERROR})
+        return
 
+    transfer = FileTransfer(file_path, peer_ip, direction="send", transfer_id=transfer_id)
+    if transfer.state == TransferState.FAILED:
+         await message_queue.put({"type": "log", "message": f"Send Error: Could not initialize transfer for '{file_name}'.", "level": logging.ERROR})
+         return
+
+    transfer.total_size = file_size
+    transfer.expected_hash = file_hash
+
+    async with active_transfers_lock:
+        outgoing_transfers_by_peer[peer_ip] = transfer_id
+        active_transfers[transfer_id] = transfer
+
+    await message_queue.put({"type": "transfer_update"})
+    await message_queue.put({"type": "log", "message": f"Starting send '{file_name}' to {peer_ip} (ID: {transfer_id[:8]})"})
+
+    init_message = json.dumps({
+        "type": "file_transfer_init", "transfer_id": transfer_id,
+        "filename": file_name, "filesize": file_size, "file_hash": file_hash
+    })
+
+    try:
+        if websocket.state != State.OPEN:
+            raise websockets.exceptions.ConnectionClosedError(1001, "Peer disconnected before init")
+        await websocket.send(init_message)
+        logger.debug(f"Sent file_transfer_init for {transfer_id[:8]} to {peer_ip}")
+
+    except Exception as e:
+        logger.error(f"Failed to send file init to {peer_ip}: {e}")
         async with active_transfers_lock:
-            if transfer_id in active_transfers and retry_count > 0:
-                transfer = active_transfers[transfer_id]
-                transfer.state = TransferState.STARTING
-                transfer.transferred_size = 0
-                transfer.error_message = None
-                logging.info(f"Retrying transfer {transfer_id}. Resetting state.")
-            else:
-                file_hash = await compute_hash(file_path)
-                if file_hash is None:
-                    logging.warning(f"Could not compute hash for {file_path} (Transfer ID: {transfer_id}), sending without integrity check.")
+            active_transfers.pop(transfer_id, None)
+            if outgoing_transfers_by_peer.get(peer_ip) == transfer_id:
+                 outgoing_transfers_by_peer.pop(peer_ip, None)
+        await message_queue.put({"type": "transfer_update"})
+        await message_queue.put({"type": "log", "message": f"Send Error: Failed to initiate transfer with {peer_ip}.", "level": logging.ERROR})
+        return
 
-                transfer = FileTransfer(file_path, "multiple_peers", direction="send") 
-                transfer.transfer_id = transfer_id
-                transfer.total_size = file_size
-                transfer.expected_hash = file_hash
-                transfer.state = TransferState.STARTING
-                active_transfers[transfer_id] = transfer
+    try:
+        async with aiofiles.open(file_path, "rb") as f:
+            transfer.file_handle = f
+            chunk_size = 1024 * 1024
+            last_yield_time = time.monotonic()
 
-
-        init_message = json.dumps({
-            "type": "file_transfer_init",
-            "transfer_id": transfer_id,
-            "filename": file_name,
-            "filesize": file_size,
-            "file_hash": transfer.expected_hash 
-        })
-
-        connected_peers = {}
-        peers_to_notify = []
-        current_peers_dict = initial_peers
-        for peer_ip, websocket in current_peers_dict.items():
-            try:
-                await websocket.send(init_message)
-                connected_peers[peer_ip] = websocket
-                peers_to_notify.append(peer_ip)
-                logging.info(f"Sent transfer init {transfer_id} for {file_name} to {peer_ip} (Attempt {retry_count+1})")
-            except websockets.exceptions.ConnectionClosed:
-                logging.warning(f"Connection closed before sending file init to {peer_ip} for {transfer_id} (Attempt {retry_count+1})")
-            except Exception as e:
-                logging.error(f"Failed to send file init to {peer_ip} for {transfer_id} (Attempt {retry_count+1}): {e}")
-
-        if not connected_peers:
-            logging.error(f"Failed to initiate file transfer {transfer_id} with any peer (Attempt {retry_count+1}).")
-            is_retryable_init_failure = False 
-            if is_retryable_init_failure and retry_count < MAX_TRANSFER_RETRIES -1: 
-                retry_delay = RETRY_BACKOFF_BASE ** retry_count
-                logging.warning(f"Initiation failed for {transfer_id}. Retrying in {retry_delay}s...")
-                await message_queue.put(f"Transfer initiation failed for '{file_name}'. Retrying in {retry_delay}s... ({retry_count+2}/{MAX_TRANSFER_RETRIES})")
-                await asyncio.sleep(retry_delay)
-                await send_file(file_path, initial_peers, retry_count + 1)
-                return 
-            else:
-                async with active_transfers_lock:
-                    if transfer_id in active_transfers:
-                        active_transfers[transfer_id].state = TransferState.FAILED
-                        active_transfers[transfer_id].error_message = "No peers connected for transfer"
-                await message_queue.put(f"Error: Could not initiate transfer '{file_name}' with recipient(s).")
-                return
-
-
-        transfer.peers = list(connected_peers.keys())
-        transfer.state = TransferState.IN_PROGRESS
-        peers_for_chunks = connected_peers.copy()
-        send_interrupted = False
-
-        try:
-            async with aiofiles.open(file_path, "rb") as f:
-                transfer.file_handle = f 
-                chunk_size = MAX_CHUNK_SIZE
-
-                while not shutdown_event.is_set():
+            while not shutdown_event.is_set() and transfer.state != TransferState.FAILED:
+                current_state = TransferState.FAILED
+                try:
                     async with transfer.condition:
-                        while transfer.state == TransferState.PAUSED and not shutdown_event.is_set():
-                            logging.debug(f"Transfer {transfer_id} is paused, waiting.")
-                            await transfer.condition.wait()
+                        current_state = transfer.state
+                except Exception as state_err:
+                     logger.error(f"Error getting transfer state for {transfer_id[:8]}: {state_err}")
+                     await transfer.fail(f"State error: {state_err}")
+                     break
 
-                        if shutdown_event.is_set():
-                            logging.info(f"Shutdown signaled during send for {transfer_id}.")
-                            transfer.state = TransferState.FAILED
-                            transfer.error_message = "Transfer cancelled due to shutdown"
-                            send_interrupted = True 
-                            break
-
-                        if transfer.state == TransferState.FAILED:
-                            logging.warning(f"Transfer {transfer_id} marked FAILED externally, stopping send loop.")
-                            send_interrupted = True 
-                            break
-                        if transfer.state == TransferState.COMPLETED:
-                            logging.info(f"Transfer {transfer_id} marked COMPLETED externally, stopping send loop.")
-                            break
-                        if transfer.state != TransferState.IN_PROGRESS:
-                            logging.warning(f"Transfer {transfer_id} in unexpected state {transfer.state.value} during send, stopping.")
-                            transfer.state = TransferState.FAILED
-                            transfer.error_message = f"Unexpected state {transfer.state.value}"
-                            send_interrupted = True
+                if current_state == TransferState.PAUSED:
+                    logger.debug(f"Transfer {transfer_id[:8]} is paused. Sending signal and waiting.")
+                    try:
+                        if websocket.state != State.OPEN:
+                            logger.warning(f"Cannot send PAUSE for {transfer_id[:8]}, peer {peer_ip} disconnected.")
+                            await transfer.fail("Peer disconnected during pause")
                             break
 
+                        pause_msg = json.dumps({"type": "TRANSFER_PAUSE", "transfer_id": transfer_id})
+                        await websocket.send(pause_msg)
+                        logger.info(f"Sent PAUSE signal for {transfer_id[:8]} to {peer_ip}")
+
+                        async with transfer.condition:
+                            while transfer.state == TransferState.PAUSED and not shutdown_event.is_set():
+                                try:
+                                    await asyncio.wait_for(transfer.condition.wait(), timeout=5.0)
+                                except asyncio.TimeoutError:
+                                    if websocket.state != State.OPEN:
+                                        logger.warning(f"Peer {peer_ip} disconnected while waiting for resume (timeout).")
+                                        await transfer.fail("Peer disconnected while paused")
+                                        break
+                                    continue
+
+                            if transfer.state == TransferState.FAILED:
+                                break
+
+                        if transfer.state == TransferState.FAILED: break
+
+                        if transfer.state == TransferState.IN_PROGRESS and not shutdown_event.is_set():
+                            if websocket.state != State.OPEN:
+                                logger.warning(f"Cannot send RESUME for {transfer_id[:8]}, peer {peer_ip} disconnected.")
+                                await transfer.fail("Peer disconnected before resume signal")
+                                break
+
+                            resume_msg = json.dumps({"type": "TRANSFER_RESUME", "transfer_id": transfer_id})
+                            await websocket.send(resume_msg)
+                            logger.info(f"Sent RESUME signal for {transfer_id[:8]} to {peer_ip}")
+                        elif shutdown_event.is_set():
+                            logger.info(f"Shutdown while paused {transfer_id[:8]}")
+                            break
+
+                    except Exception as signal_err:
+                         logger.error(f"Error sending PAUSE/RESUME signal for {transfer_id[:8]}: {signal_err}", exc_info=True)
+                         await transfer.fail(f"Signaling error: {signal_err}")
+                         break
+                    continue
+
+                elif current_state == TransferState.IN_PROGRESS:
                     try:
                         chunk = await f.read(chunk_size)
-                    except OSError as read_err:
-                        logging.error(f"Error reading file chunk for {transfer_id}: {read_err}")
-                        transfer.state = TransferState.FAILED 
-                        transfer.error_message = f"File read error: {read_err}"
-                        send_interrupted = True
-                        raise read_err 
+                        if not chunk:
+                            await asyncio.sleep(0.1)
+                            if transfer.state != TransferState.FAILED:
+                                transfer.state = TransferState.COMPLETED
+                            logger.debug(f"Reached EOF for {transfer_id[:8]}. Final state: {transfer.state}")
+                            break
 
-                    if not chunk:
-                        if transfer.state != TransferState.COMPLETED: 
-                            transfer.state = TransferState.COMPLETED
-                            logging.info(f"Finished reading file for transfer {transfer_id}")
-                        break 
+                        if websocket.state != State.OPEN:
+                             logger.warning(f"Peer {peer_ip} disconnected before sending chunk.")
+                             await transfer.fail("Peer disconnected during send")
+                             break
 
-                    current_chunk_size = len(chunk)
-                    transfer.transferred_size += current_chunk_size
+                        await websocket.send(chunk)
+                        transfer.transferred_size += len(chunk)
 
-                    disconnected_peers_in_chunk = []
-                    for peer_ip, websocket in list(peers_for_chunks.items()):
-                        try:
-                            await websocket.send(chunk)
-                        except websockets.exceptions.ConnectionClosed as conn_err:
-                            logging.warning(f"Connection to {peer_ip} closed during file transfer {transfer_id}. Removing peer.")
-                            disconnected_peers_in_chunk.append(peer_ip)
-                            del peers_for_chunks[peer_ip]
-                        except Exception as send_err:
-                            logging.error(f"Error sending chunk to {peer_ip} for {transfer_id}: {send_err}. Removing peer.")
-                            disconnected_peers_in_chunk.append(peer_ip)
-                            del peers_for_chunks[peer_ip]
+                        current_time = time.monotonic()
+                        if current_time - last_yield_time > 0.1:
+                           await asyncio.sleep(0)
+                           last_yield_time = current_time
 
-                    if disconnected_peers_in_chunk:
-                        async with active_transfers_lock:
-                            if transfer_id in active_transfers:
-                                current_peers = active_transfers[transfer_id].peers
-                                active_transfers[transfer_id].peers = [p for p in current_peers if p not in disconnected_peers_in_chunk]
+                    except (websockets.exceptions.ConnectionClosedOK, websockets.exceptions.ConnectionClosedError) as conn_err:
+                         logger.warning(f"Connection closed during send for {transfer_id[:8]}: {conn_err}")
+                         await transfer.fail(f"Connection closed: {conn_err.reason}")
+                         break
+                    except Exception as send_err:
+                        logger.error(f"Error sending chunk for {transfer_id[:8]}: {send_err}", exc_info=True)
+                        await transfer.fail(f"Send error: {send_err}")
+                        break
 
-                    if not peers_for_chunks:
-                        logging.warning(f"All peers disconnected during file transfer {transfer_id}.")
-                        transfer.state = TransferState.FAILED
-                        transfer.error_message = "All recipients disconnected"
-                        send_interrupted = True
-                        raise websockets.exceptions.ConnectionClosed("All peers disconnected during transfer")
+                elif current_state in (TransferState.FAILED, TransferState.COMPLETED):
+                     logger.debug(f"Transfer {transfer_id[:8]} loop exiting due to state: {current_state}")
+                     break
 
+                else:
+                     logger.error(f"Unexpected transfer state {current_state} for {transfer_id[:8]}. Failing.")
+                     await transfer.fail(f"Unexpected state: {current_state}")
+                     break
 
-        except (websockets.exceptions.ConnectionClosed, OSError) as network_or_file_err:
-            logging.warning(f"Network/File error during file transfer {transfer_id}, attempt {retry_count+1}: {network_or_file_err}")
-            send_interrupted = True 
+    except Exception as e:
+        logger.exception(f"Error during file send processing for {transfer_id[:8]}")
+        if transfer.state not in (TransferState.FAILED, TransferState.COMPLETED):
+             await transfer.fail(f"Send processing error: {e}")
+    finally:
+        logger.debug(f"Entering finally block for send_file {transfer_id[:8]}. Final state: {transfer.state}")
+        if transfer.file_handle:
+            await safe_close_file(transfer.file_handle)
+            transfer.file_handle = None
 
-        except Exception as e:
-            logging.exception(f"Unexpected error during file send loop for {transfer_id}: {e}")
-            async with active_transfers_lock:
-                if transfer_id in active_transfers:
-                    active_transfers[transfer_id].state = TransferState.FAILED
-                    active_transfers[transfer_id].error_message = f"Unexpected send error: {e}"
-            send_interrupted = True 
-
-        finally:
-            if hasattr(transfer, 'file_handle') and transfer.file_handle and not transfer.file_handle.closed:
-                try:
-                    await transfer.file_handle.close()
-                    logging.debug(f"Closed file handle for sender {transfer_id} after attempt {retry_count + 1}")
-                    transfer.file_handle = None
-                except Exception as close_err:
-                    logging.error(f"Error closing sender file handle for {transfer_id} after attempt {retry_count + 1}: {close_err}")
-
-        if send_interrupted and transfer.state == TransferState.FAILED and not shutdown_event.is_set():
-            is_retryable_error = isinstance(transfer.error_message, str) and \
-                                ("disconnected" in transfer.error_message.lower() or \
-                                "read error" in transfer.error_message.lower()) 
-
-            if is_retryable_error and retry_count < MAX_TRANSFER_RETRIES -1: 
-                retry_delay = RETRY_BACKOFF_BASE ** retry_count
-                logging.warning(f"Transfer {transfer_id} interrupted. Retrying in {retry_delay}s...")
-                await message_queue.put(f"Transfer '{file_name}' interrupted. Retrying in {retry_delay}s... ({retry_count+2}/{MAX_TRANSFER_RETRIES})")
-                await asyncio.sleep(retry_delay)
-
-                await send_file(file_path, initial_peers, retry_count + 1)
-                return 
-            elif not is_retryable_error:
-                logging.error(f"Transfer {transfer_id} failed with non-retryable error: {transfer.error_message}")
-                await message_queue.put(f"Failed to send '{file_name}'. Reason: {transfer.error_message}")
-                return
-            else: 
-                logging.error(f"Failed to send {file_name} (Transfer ID: {transfer_id}) after {MAX_TRANSFER_RETRIES} attempts due to: {transfer.error_message}")
-                await message_queue.put(f"Failed to send '{file_name}' after {MAX_TRANSFER_RETRIES} attempts.")
-                return
-
-        final_state = TransferState.UNKNOWN
-        final_error = "Unknown"
-        async with active_transfers_lock:
-            if transfer_id in active_transfers:
-                final_state = active_transfers[transfer_id].state
-                final_error = active_transfers[transfer_id].error_message
-
+        final_state = transfer.state
         if final_state == TransferState.COMPLETED:
-            logging.info(f"File sending task {transfer_id} ({file_name}) completed successfully on attempt {retry_count + 1}.")
-            await message_queue.put(f"Successfully sent '{file_name}'.")
-            completion_message = json.dumps({"type": "transfer_complete", "transfer_id": transfer_id})
-
-            if not peers_to_notify_completion and connected_peers:
-                peers_to_notify_completion = connected_peers 
-
-            for peer_ip, websocket in peers_to_notify_completion.items():
-                try:
-                    await websocket.send(completion_message)
-                except Exception as final_send_err:
-                    logging.warning(f"Failed to send completion message to {peer_ip} for {transfer_id}: {final_send_err}")
-
+            logger.info(f"File transfer {transfer_id[:8]} completed sending.")
+            await message_queue.put({"type": "log", "message": f"Sent '{file_name}' successfully."})
+        elif shutdown_event.is_set() and final_state != TransferState.FAILED:
+             logger.info(f"Send {transfer_id[:8]} cancelled by shutdown.")
+             await message_queue.put({"type": "log", "message": f"Send '{file_name}' cancelled by shutdown."})
+             await transfer.fail("Shutdown initiated")
         elif final_state == TransferState.FAILED:
-            logging.warning(f"File sending task {transfer_id} ({file_name}) ended with state: {final_state.value}. Reason: {final_error}")
-            if not send_interrupted: 
-                await message_queue.put(f"Failed to send '{file_name}'. Reason: {final_error}")
+             logger.warning(f"File transfer {transfer_id[:8]} ended in FAILED state.")
+
+        await message_queue.put({"type": "transfer_update"})
+
+        async with active_transfers_lock:
+            if outgoing_transfers_by_peer.get(peer_ip) == transfer_id:
+                outgoing_transfers_by_peer.pop(peer_ip, None)
+                logger.debug(f"Removed {transfer_id[:8]} from outgoing tracking for {peer_ip}")
 
 async def update_transfer_progress():
-    logging.info("Starting transfer progress updater task.")
-    try:
-        while not shutdown_event.is_set():
-            try:
-                processed_ids = set()
+    while not shutdown_event.is_set():
+        try:
+            transfers_to_remove = []
+            updated = False
+            current_active_transfers = {}
+
+            async with active_transfers_lock:
+                current_active_transfers = dict(active_transfers)
+
+            for transfer_id, transfer in current_active_transfers.items():
+                async with transfer.condition:
+                    current_state = transfer.state
+
+                if current_state in (TransferState.COMPLETED, TransferState.FAILED):
+                    transfers_to_remove.append(transfer_id)
+                    updated = True
+                elif current_state == TransferState.IN_PROGRESS and transfer.total_size > 0:
+                    progress = int((transfer.transferred_size / transfer.total_size) * 100)
+                    await message_queue.put({
+                        "type": "transfer_progress",
+                        "transfer_id": transfer_id,
+                        "progress": progress
+                    })
+                elif current_state == TransferState.PAUSED:
+                    updated = True
+
+            if transfers_to_remove:
+                removed_count = 0
                 async with active_transfers_lock:
-                    transfers_to_process = list(active_transfers.items())
+                    for tid in transfers_to_remove:
+                        if tid in active_transfers:
+                            transfer_to_remove = active_transfers[tid]
+                            async with transfer_to_remove.condition:
+                                final_state_check = transfer_to_remove.state
 
-                for transfer_id, transfer in transfers_to_process:
-                    if transfer_id in processed_ids:
-                        continue
+                            if final_state_check in (TransferState.COMPLETED, TransferState.FAILED):
+                                if transfer_to_remove.direction == "send":
+                                    peer_ip_remove = transfer_to_remove.peer_ip
+                                    if outgoing_transfers_by_peer.get(peer_ip_remove) == tid:
+                                        outgoing_transfers_by_peer.pop(peer_ip_remove, None)
 
-                    try:
-                        if transfer.state == TransferState.COMPLETED:
-                            logging.info(f"Removing completed transfer {transfer_id} (State: {transfer.state.value})")
-                            if transfer.file_handle and not transfer.file_handle.closed:
-                                try:
-                                    await transfer.file_handle.close()
-                                    logging.debug(f"Closed file handle for completed transfer {transfer_id}")
-                                except Exception as fh_e:
-                                    logging.error(f"Error closing file handle for completed transfer {transfer_id}: {fh_e}")
+                                if transfer_to_remove.file_handle:
+                                     logger.warning(f"File handle for {tid[:8]} still open during cleanup. Closing.")
+                                     await safe_close_file(transfer_to_remove.file_handle)
+                                     transfer_to_remove.file_handle = None
 
-                            async with active_transfers_lock:
-                                if transfer_id in active_transfers:
-                                    del active_transfers[transfer_id]
-                                    processed_ids.add(transfer_id)
-                                else:
-                                    logging.warning(f"Completed transfer {transfer_id} already removed before cleanup.")
+                                del active_transfers[tid]
+                                removed_count += 1
+                                logger.info(f"Removed finished/failed transfer {tid[:8]} from active list.")
+                        else:
+                            logger.debug(f"Transfer {tid[:8]} already removed while processing removal list.")
 
-                        elif transfer.state == TransferState.FAILED:
-                            error_msg = getattr(transfer, 'error_message', 'No reason specified')
-                            logging.warning(f"Removing failed transfer {transfer_id} (State: {transfer.state.value}, Reason: {error_msg})")
-                            if transfer.file_handle and not transfer.file_handle.closed:
-                                try:
-                                    await transfer.file_handle.close()
-                                    logging.debug(f"Closed file handle for failed transfer {transfer_id}")
-                                except Exception as fh_e:
-                                    logging.error(f"Error closing file handle for FAILED transfer {transfer_id}: {fh_e}")
+                if removed_count > 0:
+                    await message_queue.put({"type": "transfer_update"})
 
-                            async with active_transfers_lock:
-                                if transfer_id in active_transfers:
-                                    del active_transfers[transfer_id]
-                                    processed_ids.add(transfer_id)
-                                else:
-                                    logging.warning(f"Failed transfer {transfer_id} already removed before cleanup.")
+            elif updated:
+                await message_queue.put({"type": "transfer_update"})
 
-                        else: 
-                            filename = getattr(transfer, 'filename', 'unknown_file')
-                            if hasattr(transfer, 'total_size') and transfer.total_size > 0:
-                                current_transferred = max(0, getattr(transfer, 'transferred_size', 0))
-                                current_total = max(1, transfer.total_size)
-                                progress = (current_transferred / current_total) * 100
-                                logging.debug(f"Transfer {transfer_id} ({filename}, {transfer.state.value}): {current_transferred}/{current_total} bytes ({progress:.1f}%)")
-                            elif hasattr(transfer, 'transferred_size') and transfer.transferred_size > 0:
-                                logging.debug(f"Transfer {transfer_id} ({filename}, {transfer.state.value}): {transfer.transferred_size} bytes transferred (total size unknown)")
-                            else:
-                                size_info = getattr(transfer, 'total_size', 'unknown')
-                                logging.debug(f"Transfer {transfer_id} ({filename}, {transfer.state.value}): Awaiting progress (Size {size_info})")
+            await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            logger.info("update_transfer_progress task cancelled.")
+            break
+        except Exception as e:
+            logger.exception(f"Error in update_transfer_progress: {e}")
+            await asyncio.sleep(5)
 
-                    except AttributeError as ae:
-                        logging.error(f"Attribute error processing transfer {transfer_id}: {ae}. Transfer object state: {getattr(transfer, 'state', 'unknown')}")
-                        async with active_transfers_lock:
-                            if transfer_id in active_transfers:
-                                logging.warning(f"Removing potentially corrupt transfer {transfer_id} due to attribute error.")
-                                if hasattr(transfer, 'file_handle') and transfer.file_handle and not transfer.file_handle.closed:
-                                    try: await transfer.file_handle.close()
-                                    except Exception: pass
-                                del active_transfers[transfer_id]
-                                processed_ids.add(transfer_id)
-                    except Exception as inner_e:
-                        logging.exception(f"Error processing individual transfer {transfer_id}: {inner_e}")
-
-                await asyncio.sleep(1)
-
-            except asyncio.CancelledError:
-                logging.info("update_transfer_progress task cancelled.")
-                raise
-            except Exception as e:
-                logging.exception(f"Error in update_transfer_progress loop iteration: {e}")
-                await asyncio.sleep(5)
-
-    finally:
-        logging.info("Transfer progress monitoring exiting, ensuring final cleanup...")
-        async with active_transfers_lock:
-            remaining_ids = list(active_transfers.keys())
-            if remaining_ids:
-                logging.warning(f"Performing final cleanup for {len(remaining_ids)} transfers remaining upon exit.")
-            for transfer_id in remaining_ids:
-                 transfer = active_transfers.get(transfer_id)
-                 logging.warning(f"Force-closing transfer {transfer_id} during final cleanup.")
-                 if transfer and hasattr(transfer, 'file_handle') and transfer.file_handle and not transfer.file_handle.closed:
-                     try:
-                         await transfer.file_handle.close()
-                     except Exception as fh_e:
-                         logging.error(f"Error during final cleanup close for {transfer_id}: {fh_e}")
-        logging.info("Final transfer cleanup attempt complete.")
+    logger.info("update_transfer_progress stopped.")
