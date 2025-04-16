@@ -669,7 +669,7 @@ async def handle_incoming_connection(websocket, peer_ip):
             pending_approvals.pop(approval_key, None)
             logger.debug(f"Cleaned up pending approval key {approval_key} in finally block.")
 
-        if connection_timestamp: # Only clean up if handshake proceeded far enough to set timestamp
+        if connection_timestamp:
             async with connection_attempts_lock:
                 attempt_info = connection_attempts.get(peer_ip)
                 if attempt_info and attempt_info[0] == "incoming" and attempt_info[1] == connection_timestamp:
@@ -798,7 +798,7 @@ async def receive_peer_messages(websocket, peer_ip):
 
                             if transfer.transferred_size >= transfer.total_size:
                                 logger.info(f"Received expected size for transfer {transfer.transfer_id[:8]} ({transfer.transferred_size}/{transfer.total_size}). Closing file.")
-                                safe_close_file(transfer.file_handle)
+                                await safe_close_file(transfer.file_handle)
                                 transfer.file_handle = None
 
                                 final_state = TransferState.COMPLETED
@@ -997,7 +997,7 @@ async def receive_peer_messages(websocket, peer_ip):
                          needs_update = False
                          log_msg = ""
                          members_list_for_update = None
-                         group_info = None # Initialize group_info
+                         group_info = None
 
                          async with groups_lock:
                              group_info = groups.get(gn)
@@ -1020,10 +1020,10 @@ async def receive_peer_messages(websocket, peer_ip):
                              await send_group_update_message(gn, members_list_for_update)
                              await message_queue.put({"type":"group_list_update"})
 
-                         if log_msg: # Log only if a message was generated
+                         if log_msg:
                             await message_queue.put({"type":"log","message":log_msg})
 
-                         if not group_info or (group_info and group_info.get("admin") != own_ip): # Check if group_info was ever found or if admin check failed
+                         if not group_info or (group_info and group_info.get("admin") != own_ip):
                              logger.warning(f"Received invite response for group '{gn}' but not admin or group doesn't exist.")
 
 
@@ -1039,7 +1039,7 @@ async def receive_peer_messages(websocket, peer_ip):
                          if group_info and group_info.get("admin") == own_ip:
                               notify_ui = False
                               async with pending_lock:
-                                   join_req_list = pending_join_requests.setdefault(gn, []) # Use setdefault for safety
+                                   join_req_list = pending_join_requests.setdefault(gn, [])
                                    if not any(r.get("requester_ip") == req_ip for r in join_req_list):
                                         join_req_list.append({"requester_ip":req_ip,"requester_username":req_uname})
                                         notify_ui = True
@@ -1112,6 +1112,19 @@ async def receive_peer_messages(websocket, peer_ip):
     finally:
         logger.debug(f"Cleaning up connection state for {peer_ip} in receive_peer_messages finally block.")
 
+        if current_receiving_transfer:
+            transfer_id_fail = current_receiving_transfer.transfer_id
+            file_path_fail = current_receiving_transfer.file_path
+            logger.warning(f"Failing active receiving transfer {transfer_id_fail[:8]} ({os.path.basename(file_path_fail)}) due to connection termination with {display_name}.")
+            try:
+                await current_receiving_transfer.fail("Connection lost during transfer")
+                logger.info(f"Successfully failed and initiated cleanup for receiving transfer {transfer_id_fail[:8]}.")
+            except Exception as fail_err:
+                 logger.error(f"Error explicitly failing receiving transfer {transfer_id_fail[:8]} in finally block: {fail_err}", exc_info=True)
+            current_receiving_transfer = None
+        else:
+             logger.debug(f"No active receiving transfer found for {peer_ip} during cleanup.")
+
         async with connections_lock:
             connections.pop(peer_ip, None)
         async with peer_data_lock:
@@ -1122,14 +1135,12 @@ async def receive_peer_messages(websocket, peer_ip):
 
         async with active_transfers_lock:
             outgoing_transfers_by_peer.pop(peer_ip, None)
-
-        if current_receiving_transfer:
-            logger.warning(f"Failing active receiving transfer {current_receiving_transfer.transfer_id[:8]} due to connection termination with {display_name}.")
-            await current_receiving_transfer.fail("Connection lost during transfer")
+            logger.debug(f"Cleared outgoing transfer tracking for {peer_ip} in finally block.")
 
         if not shutdown_event.is_set():
             await message_queue.put({"type": "connection_status", "peer_ip": peer_ip, "connected": False})
-            await message_queue.put({"type": "log", "message": f"Disconnected from {display_name}"})
+            final_display_name = get_peer_display_name(peer_ip)
+            await message_queue.put({"type": "log", "message": f"Disconnected from {final_display_name}"})
 
         logger.info(f"Message receive loop finished for {display_name} ({peer_ip})")
 
@@ -1185,16 +1196,7 @@ async def maintain_peer_list(discovery_instance):
 
 
 async def user_input(discovery):
-    # This function is likely intended for a command-line interface (CLI) version.
-    # In a GUI application, user input is handled by the GUI framework (e.g., Tkinter).
-    # We keep it here as a placeholder, but it shouldn't be actively run in GUI mode.
-    # logger.debug("Placeholder user_input task started (intended for CLI).")
-    # await asyncio.sleep(3600) # Sleep for a long time to avoid resource usage
     pass
 
 async def display_messages():
-    # Similar to user_input, this is likely for CLI output.
-    # GUI updates are handled by putting messages onto the message_queue.
-    # logger.debug("Placeholder display_messages task started (intended for CLI).")
-    # await asyncio.sleep(3600)
     pass
